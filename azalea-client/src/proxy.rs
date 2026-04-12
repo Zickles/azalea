@@ -2,10 +2,7 @@ use std::{
     collections::HashSet,
     io::Cursor,
     net::SocketAddr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{ Arc, Mutex, atomic::{ AtomicBool, Ordering } },
 };
 
 use aes::Aes128;
@@ -32,21 +29,21 @@ use azalea_protocol::{
             ClientboundStatusPacket,
             ClientboundStatusResponse,
             ServerboundStatusPacket,
-            c_status_response::{Players, Version},
+            c_status_response::{ Players, Version },
         },
     },
-    read::{deserialize_packet, read_raw_packet},
-    write::{encode_to_network_packet, serialize_packet, write_raw_packet},
+    read::{ deserialize_packet, read_raw_packet },
+    write::{ encode_to_network_packet, serialize_packet, write_raw_packet },
 };
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey};
+use rsa::{ Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey };
 use tokio::{
     io::AsyncWriteExt,
-    net::{TcpListener, TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}},
+    net::{ TcpListener, TcpStream, tcp::{ OwnedReadHalf, OwnedWriteHalf } },
     sync::mpsc,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{ debug, error, info, warn };
 
 use crate::connection::RawConnection;
 
@@ -85,16 +82,21 @@ impl Plugin for ProxyPlugin {
         let bind_addr = self.bind_addr;
         let handle = self.tokio_handle.clone();
         std::thread::spawn(move || {
-            handle.spawn(run_listener(bind_addr, private_key, public_key, client_tx, config_packets));
+            handle.spawn(
+                run_listener(bind_addr, private_key, public_key, client_tx, config_packets)
+            );
         });
 
         app.insert_resource(state)
-            .add_systems(PreUpdate, (
-                accept_client,
-                manage_config_buffer,
-                buffer_config_packets,
-                forward_server_to_client,
-            ).chain())
+            .add_systems(
+                PreUpdate,
+                (
+                    accept_client,
+                    manage_config_buffer,
+                    buffer_config_packets,
+                    forward_server_to_client,
+                ).chain()
+            )
             .add_systems(PostUpdate, forward_client_to_server);
     }
 }
@@ -121,8 +123,12 @@ pub struct AttachedClient {
 }
 
 fn accept_client(state: Res<ProxyState>) {
-    let Ok(mut rx) = state.client_rx.try_lock() else { return };
-    let Ok(pending) = rx.try_recv() else { return };
+    let Ok(mut rx) = state.client_rx.try_lock() else {
+        return;
+    };
+    let Ok(pending) = rx.try_recv() else {
+        return;
+    };
 
     info!("Vanilla client attached");
 
@@ -133,21 +139,42 @@ fn accept_client(state: Res<ProxyState>) {
     });
 }
 
-fn manage_config_buffer(state: Res<ProxyState>, conn_query: Query<&RawConnection>) {
-    let Ok(conn) = conn_query.single() else { return };
+fn manage_config_buffer(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
+    let Ok(mut conn) = conn_query.get_single_mut() else {
+        return;
+    };
+
     match conn.state {
-        ConnectionProtocol::Game => {
-            if !state.config_locked.load(Ordering::Relaxed) {
-                let count = state.config_packets.lock().unwrap().len();
-                info!("Proxy: config buffer locked with {count} packets");
-                state.config_locked.store(true, Ordering::Relaxed);
-            }
-        }
         ConnectionProtocol::Configuration => {
             if state.config_locked.load(Ordering::Relaxed) {
+                // Bot reconnected, clear old buffer
                 state.config_packets.lock().unwrap().clear();
                 state.config_locked.store(false, Ordering::Relaxed);
                 info!("Proxy: config buffer cleared for reconnect");
+            }
+        }
+        ConnectionProtocol::Game => {
+            if !state.config_locked.load(Ordering::Relaxed) {
+                // Only lock if we actually have a FinishConfiguration in the buffer
+                let buf = state.config_packets.lock().unwrap();
+                let has_finish = buf
+                    .iter()
+                    .any(|raw| {
+                        matches!(
+                            deserialize_packet::<ClientboundConfigPacket>(
+                                &mut Cursor::new(raw as &[u8])
+                            ),
+                            Ok(ClientboundConfigPacket::FinishConfiguration(_))
+                        )
+                    });
+                drop(buf);
+                if has_finish {
+                    let count = state.config_packets.lock().unwrap().len();
+                    info!("Proxy: config buffer locked with {count} packets (complete)");
+                    state.config_locked.store(true, Ordering::Relaxed);
+                } else {
+                    info!("Proxy: in game state but no FinishConfiguration in buffer, not locking");
+                }
             }
         }
         _ => {}
@@ -157,10 +184,13 @@ fn manage_config_buffer(state: Res<ProxyState>, conn_query: Query<&RawConnection
 fn buffer_config_packets(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     for mut conn in conn_query.iter_mut() {
         let tapped = conn.take_tapped_packets();
-        if tapped.is_empty() { continue; }
+        if tapped.is_empty() {
+            continue;
+        }
 
-        if conn.state != ConnectionProtocol::Configuration
-            || state.config_locked.load(Ordering::Relaxed)
+        if
+            conn.state != ConnectionProtocol::Configuration ||
+            state.config_locked.load(Ordering::Relaxed)
         {
             continue;
         }
@@ -174,7 +204,9 @@ fn buffer_config_packets(state: Res<ProxyState>, mut conn_query: Query<&mut RawC
 
 fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     let mut attached = state.attached.lock().unwrap();
-    let Some(client) = attached.as_mut() else { return };
+    let Some(client) = attached.as_mut() else {
+        return;
+    };
 
     if client.disconnected.load(Ordering::Relaxed) {
         info!("Vanilla client detached");
@@ -183,7 +215,9 @@ fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut R
     }
 
     for mut conn in conn_query.iter_mut() {
-        if conn.state != ConnectionProtocol::Game { continue; }
+        if conn.state != ConnectionProtocol::Game {
+            continue;
+        }
         for raw in conn.take_tapped_packets() {
             let _ = client.clientbound_tx.send(raw);
         }
@@ -192,8 +226,12 @@ fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut R
 
 fn forward_client_to_server(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     let mut attached = state.attached.lock().unwrap();
-    let Some(client) = attached.as_mut() else { return };
-    let Ok(mut conn) = conn_query.single_mut() else { return };
+    let Some(client) = attached.as_mut() else {
+        return;
+    };
+    let Ok(mut conn) = conn_query.single_mut() else {
+        return;
+    };
 
     if conn.state != ConnectionProtocol::Game {
         while client.serverbound_rx.try_recv().is_ok() {}
@@ -210,7 +248,9 @@ fn forward_client_to_server(state: Res<ProxyState>, mut conn_query: Query<&mut R
                     }
                 }
             }
-            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                break;
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 *attached = None;
                 break;
@@ -224,7 +264,7 @@ async fn run_listener(
     private_key: Arc<RsaPrivateKey>,
     public_key: Arc<RsaPublicKey>,
     client_tx: mpsc::UnboundedSender<PendingClient>,
-    config_packets: Arc<Mutex<Vec<Box<[u8]>>>>,
+    config_packets: Arc<Mutex<Vec<Box<[u8]>>>>
 ) {
     let listener = TcpListener::bind(bind_addr).await.expect("ProxyPlugin: failed to bind");
     info!("ProxyPlugin listening on {bind_addr}");
@@ -253,7 +293,7 @@ async fn do_handshake(
     private_key: Arc<RsaPrivateKey>,
     public_key: RsaPublicKey,
     client_tx: mpsc::UnboundedSender<PendingClient>,
-    config_packets: Arc<Mutex<Vec<Box<[u8]>>>>,
+    config_packets: Arc<Mutex<Vec<Box<[u8]>>>>
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
     let (mut read, mut write) = stream.into_split();
@@ -314,7 +354,8 @@ async fn do_handshake(
     );
     let url = format!(
         "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={}&serverId={}",
-        username, server_hash
+        username,
+        server_hash
     );
     info!("Proxy: checking hasJoined for username='{}' hash='{}'", username, server_hash);
     let resp = reqwest::get(&url).await?;
@@ -323,7 +364,8 @@ async fn do_handshake(
     info!("Proxy: hasJoined status={status}");
     anyhow::ensure!(status != 204, "Mojang auth failed");
     let profile_json: serde_json::Value = serde_json::from_str(&body)?;
-    let uuid = uuid::Uuid::parse_str(profile_json["id"].as_str().unwrap_or(""))
+    let uuid = uuid::Uuid
+        ::parse_str(profile_json["id"].as_str().unwrap_or(""))
         .unwrap_or(profile_id);
     let name = profile_json["name"].as_str().unwrap_or(&username).to_string();
     info!("Proxy: authenticated {name}");
@@ -351,7 +393,9 @@ async fn do_handshake(
         match deserialize_packet::<ClientboundConfigPacket>(&mut Cursor::new(raw as &[u8])) {
             Ok(pkt) => {
                 match &pkt {
-                    ClientboundConfigPacket::FinishConfiguration(_) => continue,
+                    ClientboundConfigPacket::FinishConfiguration(_) => {
+                        continue;
+                    }
                     ClientboundConfigPacket::RegistryData(p) => {
                         let key = p.registry_id.to_string();
                         if !seen_registries.insert(key) {
@@ -375,9 +419,7 @@ async fn do_handshake(
 
     loop {
         let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
-        let pkt = deserialize_packet::<ServerboundConfigPacket>(
-            &mut Cursor::new(&raw as &[u8])
-        )?;
+        let pkt = deserialize_packet::<ServerboundConfigPacket>(&mut Cursor::new(&raw as &[u8]))?;
         if let ServerboundConfigPacket::FinishConfiguration(_) = pkt {
             break;
         }
@@ -414,7 +456,7 @@ async fn handle_status(
     write: &mut OwnedWriteHalf,
     buf: &mut Cursor<Vec<u8>>,
     dec: &mut Option<Aes128CfbDec>,
-    enc: &mut Option<Aes128CfbEnc>,
+    enc: &mut Option<Aes128CfbEnc>
 ) -> anyhow::Result<()> {
     let raw = read_raw_packet(read, buf, None, dec).await?;
     let _ = deserialize_packet::<ServerboundStatusPacket>(&mut Cursor::new(&raw as &[u8]))?;
@@ -442,7 +484,7 @@ async fn client_write_task(
     mut write: OwnedWriteHalf,
     mut enc: Option<Aes128CfbEnc>,
     mut rx: mpsc::UnboundedReceiver<Box<[u8]>>,
-    disconnected: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>
 ) {
     while let Some(raw_packet) = rx.recv().await {
         let network_bytes = encode_to_network_packet(&raw_packet, None, &mut enc);
@@ -459,7 +501,7 @@ async fn client_read_task(
     mut dec: Option<Aes128CfbDec>,
     mut buf: Cursor<Vec<u8>>,
     tx: mpsc::UnboundedSender<Box<[u8]>>,
-    disconnected: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>
 ) {
     loop {
         match read_raw_packet(&mut read, &mut buf, None, &mut dec).await {
