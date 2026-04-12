@@ -362,6 +362,8 @@ dependencies = [
 name = "azalea-client"
 version = "0.16.0+mc26.1"
 dependencies = [
+ "aes",
+ "anyhow",
  "async-compat",
  "azalea-auth",
  "azalea-block",
@@ -381,14 +383,18 @@ dependencies = [
  "bevy_tasks",
  "bevy_time",
  "bevy_utils",
+ "cfb8",
  "chrono",
  "derive_more",
  "eyre",
  "indexmap",
  "minecraft_folder_path",
  "parking_lot",
+ "rand 0.10.0",
  "regex",
  "reqwest",
+ "rsa",
+ "serde_json",
  "simdnbt",
  "thiserror 2.0.18",
  "tokio",

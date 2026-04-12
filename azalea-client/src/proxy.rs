@@ -46,7 +46,7 @@ impl Plugin for ProxyPlugin {
     fn build(&self, app: &mut App) {
         let (client_tx, client_rx) = mpsc::unbounded_channel::<PendingClient>();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let private_key = Arc::new(RsaPrivateKey::new(&mut rng, 2048).unwrap());
         let public_key = RsaPublicKey::from(private_key.as_ref());
 
@@ -101,16 +101,6 @@ fn accept_client(state: Res<ProxyState>) {
 
     info!("Vanilla client attached");
 
-    // Spin up the write task now that we have the enc key and channel
-    let enc_key = pending.client_enc_key;
-    let cb_rx_for_task = {
-        // We need a separate mpsc pair so the write task owns the receiver.
-        // The ECS holds the sender (clientbound_tx on AttachedClient).
-        // We already have that from the handshake — just pass it through.
-        pending.clientbound_tx.clone()
-    };
-
-    // The write task was already spawned in do_handshake with the correct key.
     *state.attached.lock().unwrap() = Some(AttachedClient {
         serverbound_rx: pending.serverbound_rx,
         clientbound_tx: pending.clientbound_tx,
@@ -146,7 +136,7 @@ fn forward_client_to_server(
 ) {
     let mut attached = state.attached.lock().unwrap();
     let Some(client) = attached.as_mut() else { return };
-    let Ok(mut conn) = conn_query.get_single_mut() else { return };
+    let Ok(mut conn) = conn_query.single_mut() else { return };
 
     loop {
         match client.serverbound_rx.try_recv() {
@@ -357,7 +347,7 @@ async fn client_read_task(
         // We pass compression=None because the client never compresses to us.
         match read_raw_packet(&mut read, &mut buf, None, &mut dec).await {
             Ok(raw) => {
-                if tx.send(raw.into_boxed_slice()).is_err() {
+                if tx.send(raw).is_err() {
                     break;
                 }
             }
