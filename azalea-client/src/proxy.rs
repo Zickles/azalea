@@ -128,8 +128,6 @@ fn accept_client(state: Res<ProxyState>) {
     });
 }
 
-// Accumulate config-state packets from the server into the replay buffer.
-// Once the bot enters game state these stop being tapped by the connection plugin.
 fn buffer_config_packets(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     for mut conn in conn_query.iter_mut() {
         if conn.state != ConnectionProtocol::Configuration {
@@ -157,7 +155,6 @@ fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut R
     }
 
     for mut conn in conn_query.iter_mut() {
-        // Only forward game-state packets to the attached client
         if conn.state != ConnectionProtocol::Game {
             continue;
         }
@@ -172,9 +169,7 @@ fn forward_client_to_server(state: Res<ProxyState>, mut conn_query: Query<&mut R
     let Some(client) = attached.as_mut() else { return };
     let Ok(mut conn) = conn_query.single_mut() else { return };
 
-    // Only forward client packets when the bot is in game state
     if conn.state != ConnectionProtocol::Game {
-        // drain and discard so the channel doesn't back up
         while client.serverbound_rx.try_recv().is_ok() {}
         return;
     }
@@ -320,27 +315,29 @@ async fn do_handshake(
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let _ = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
 
-    // Replay all config packets the server sent to the bot during its own config phase.
-    // This includes registry data, tags, etc. that the client needs before FinishConfiguration.
+    // Replay config packets — only valid ClientboundConfigPackets, skip FinishConfiguration
     let replayed = config_packets.lock().unwrap().clone();
     info!("Proxy: replaying {} config packets to client", replayed.len());
+    let mut forwarded = 0usize;
     for raw in &replayed {
-        // Skip FinishConfiguration — we send that ourselves at the end
-        if let Ok(pkt) = deserialize_packet::<ClientboundConfigPacket>(
-            &mut Cursor::new(raw as &[u8])
-        ) {
-            if matches!(pkt, ClientboundConfigPacket::FinishConfiguration(_)) {
-                continue;
+        match deserialize_packet::<ClientboundConfigPacket>(&mut Cursor::new(raw as &[u8])) {
+            Ok(pkt) => {
+                if matches!(pkt, ClientboundConfigPacket::FinishConfiguration(_)) {
+                    continue;
+                }
+                write_raw_packet(raw, &mut write, None, &mut enc).await?;
+                forwarded += 1;
+            }
+            Err(_) => {
+                debug!("Proxy: skipping non-config packet in replay buffer");
             }
         }
-        write_raw_packet(raw, &mut write, None, &mut enc).await?;
     }
+    info!("Proxy: forwarded {forwarded} valid config packets");
 
-    // Send finish configuration
     let finish = ClientboundConfigPacket::FinishConfiguration(ClientboundFinishConfiguration);
     write_raw_packet(&serialize_packet(&finish)?, &mut write, None, &mut enc).await?;
 
-    // Drain client config packets until finish configuration ack
     loop {
         let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
         let pkt = deserialize_packet::<ServerboundConfigPacket>(
@@ -357,6 +354,15 @@ async fn do_handshake(
     let (cb_tx, cb_rx) = mpsc::unbounded_channel::<Box<[u8]>>();
     let disconnected = Arc::new(AtomicBool::new(false));
 
+    // Send to ECS first so game packets start queuing
+    client_tx.send(PendingClient {
+        serverbound_rx: sb_rx,
+        clientbound_tx: cb_tx,
+        disconnected: disconnected.clone(),
+        client_enc_key: client_key,
+    })?;
+
+    // Then spawn tasks
     let disc_w = disconnected.clone();
     tokio::spawn(async move {
         client_write_task(write, enc, cb_rx, disc_w).await;
@@ -366,13 +372,6 @@ async fn do_handshake(
     tokio::spawn(async move {
         client_read_task(read, dec, buf, sb_tx, disc_r).await;
     });
-
-    client_tx.send(PendingClient {
-        serverbound_rx: sb_rx,
-        clientbound_tx: cb_tx,
-        disconnected,
-        client_enc_key: client_key,
-    })?;
 
     Ok(())
 }
