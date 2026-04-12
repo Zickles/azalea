@@ -1,4 +1,12 @@
-use std::{ collections::HashSet, io::Cursor, net::SocketAddr, sync::{ Arc, Mutex, atomic::{ AtomicBool, Ordering } } };
+use std::{
+    collections::HashSet,
+    io::Cursor,
+    net::SocketAddr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use aes::Aes128;
 use azalea_crypto::Aes128CfbDec;
@@ -24,21 +32,21 @@ use azalea_protocol::{
             ClientboundStatusPacket,
             ClientboundStatusResponse,
             ServerboundStatusPacket,
-            c_status_response::{ Players, Version },
+            c_status_response::{Players, Version},
         },
     },
-    read::{ deserialize_packet, read_raw_packet },
-    write::{ encode_to_network_packet, serialize_packet, write_raw_packet },
+    read::{deserialize_packet, read_raw_packet},
+    write::{encode_to_network_packet, serialize_packet, write_raw_packet},
 };
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use rsa::{ Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey };
+use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey};
 use tokio::{
     io::AsyncWriteExt,
-    net::{ TcpListener, TcpStream, tcp::{ OwnedReadHalf, OwnedWriteHalf } },
+    net::{TcpListener, TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}},
     sync::mpsc,
 };
-use tracing::{ debug, error, info, warn };
+use tracing::{debug, error, info, warn};
 
 use crate::connection::RawConnection;
 
@@ -65,28 +73,25 @@ impl Plugin for ProxyPlugin {
         let public_key = Arc::new(RsaPublicKey::from(private_key.as_ref()));
 
         let config_packets: Arc<Mutex<Vec<Box<[u8]>>>> = Arc::new(Mutex::new(Vec::new()));
+        let config_locked = Arc::new(AtomicBool::new(false));
 
         let state = ProxyState {
             attached: Arc::new(Mutex::new(None)),
             client_rx: Mutex::new(client_rx),
             config_packets: config_packets.clone(),
+            config_locked: config_locked.clone(),
         };
 
         let bind_addr = self.bind_addr;
         let handle = self.tokio_handle.clone();
         std::thread::spawn(move || {
-            handle.spawn(run_listener(
-                bind_addr,
-                private_key,
-                public_key,
-                client_tx,
-                config_packets,
-            ));
+            handle.spawn(run_listener(bind_addr, private_key, public_key, client_tx, config_packets));
         });
 
         app.insert_resource(state)
             .add_systems(PreUpdate, (
                 accept_client,
+                manage_config_buffer,
                 buffer_config_packets,
                 forward_server_to_client,
             ).chain())
@@ -99,6 +104,7 @@ pub struct ProxyState {
     pub attached: Arc<Mutex<Option<AttachedClient>>>,
     client_rx: Mutex<mpsc::UnboundedReceiver<PendingClient>>,
     pub config_packets: Arc<Mutex<Vec<Box<[u8]>>>>,
+    config_locked: Arc<AtomicBool>,
 }
 
 pub struct PendingClient {
@@ -127,15 +133,38 @@ fn accept_client(state: Res<ProxyState>) {
     });
 }
 
+fn manage_config_buffer(state: Res<ProxyState>, conn_query: Query<&RawConnection>) {
+    let Ok(conn) = conn_query.single() else { return };
+    match conn.state {
+        ConnectionProtocol::Game => {
+            if !state.config_locked.load(Ordering::Relaxed) {
+                let count = state.config_packets.lock().unwrap().len();
+                info!("Proxy: config buffer locked with {count} packets");
+                state.config_locked.store(true, Ordering::Relaxed);
+            }
+        }
+        ConnectionProtocol::Configuration => {
+            if state.config_locked.load(Ordering::Relaxed) {
+                state.config_packets.lock().unwrap().clear();
+                state.config_locked.store(false, Ordering::Relaxed);
+                info!("Proxy: config buffer cleared for reconnect");
+            }
+        }
+        _ => {}
+    }
+}
+
 fn buffer_config_packets(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     for mut conn in conn_query.iter_mut() {
-        if conn.state != ConnectionProtocol::Configuration {
-            continue;
-        }
         let tapped = conn.take_tapped_packets();
-        if tapped.is_empty() {
+        if tapped.is_empty() { continue; }
+
+        if conn.state != ConnectionProtocol::Configuration
+            || state.config_locked.load(Ordering::Relaxed)
+        {
             continue;
         }
+
         let mut buf = state.config_packets.lock().unwrap();
         for raw in tapped {
             buf.push(raw);
@@ -154,11 +183,8 @@ fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut R
     }
 
     for mut conn in conn_query.iter_mut() {
-        if conn.state != ConnectionProtocol::Game {
-            continue;
-        }
+        if conn.state != ConnectionProtocol::Game { continue; }
         for raw in conn.take_tapped_packets() {
-            debug!("Proxy: forwarding game packet, id byte={:#x}, len={}", raw[0], raw.len());
             let _ = client.clientbound_tx.send(raw);
         }
     }
@@ -294,7 +320,7 @@ async fn do_handshake(
     let resp = reqwest::get(&url).await?;
     let status = resp.status().as_u16();
     let body = resp.text().await?;
-    info!("Proxy: hasJoined status={status} body={body}");
+    info!("Proxy: hasJoined status={status}");
     anyhow::ensure!(status != 204, "Mojang auth failed");
     let profile_json: serde_json::Value = serde_json::from_str(&body)?;
     let uuid = uuid::Uuid::parse_str(profile_json["id"].as_str().unwrap_or(""))
@@ -316,7 +342,7 @@ async fn do_handshake(
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let _ = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
 
-    // Replay config packets — deduplicate registry data by registry_id, skip FinishConfiguration
+    // Replay config packets — deduplicate registry data, skip FinishConfiguration
     let replayed = config_packets.lock().unwrap().clone();
     info!("Proxy: replaying {} config packets to client", replayed.len());
     let mut forwarded = 0usize;
@@ -337,8 +363,8 @@ async fn do_handshake(
                 write_raw_packet(raw, &mut write, None, &mut enc).await?;
                 forwarded += 1;
             }
-            Err(_) => {
-                debug!("Proxy: skipping non-config packet in replay buffer");
+            Err(e) => {
+                debug!("Proxy: skipping packet in replay, deserialize error: {e}");
             }
         }
     }
@@ -405,9 +431,7 @@ async fn handle_status(
     let raw = read_raw_packet(read, buf, None, dec).await?;
     let ping = deserialize_packet::<ServerboundStatusPacket>(&mut Cursor::new(&raw as &[u8]))?;
     if let ServerboundStatusPacket::PingRequest(p) = ping {
-        let pong = ClientboundStatusPacket::PongResponse(ClientboundPongResponse {
-            time: p.time,
-        });
+        let pong = ClientboundStatusPacket::PongResponse(ClientboundPongResponse { time: p.time });
         write_raw_packet(&serialize_packet(&pong)?, write, None, enc).await?;
     }
 
