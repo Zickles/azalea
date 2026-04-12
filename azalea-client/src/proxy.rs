@@ -6,6 +6,12 @@ use azalea_protocol::{
     packets::{
         ClientIntention,
         PROTOCOL_VERSION,
+        config::{
+            ClientboundConfigPacket,
+            ClientboundFinishConfiguration,
+            ClientboundCustomPayload,
+            ServerboundConfigPacket,
+        },
         handshake::ServerboundHandshakePacket,
         login::{
             ClientboundHello,
@@ -24,6 +30,7 @@ use azalea_protocol::{
     read::{ deserialize_packet, read_raw_packet },
     write::{ encode_to_network_packet, serialize_packet, write_raw_packet },
 };
+use azalea_registry::identifier::Identifier;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use rsa::{ Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey };
@@ -211,6 +218,7 @@ async fn do_handshake(
         return handle_status(&mut read, &mut write, &mut buf, &mut dec, &mut enc).await;
     }
 
+    // Login start
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let pkt = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
     let (username, profile_id) = match &pkt {
@@ -218,6 +226,7 @@ async fn do_handshake(
         _ => anyhow::bail!("expected Hello"),
     };
 
+    // Encryption request
     let verify_token: [u8; 4] = rand::random();
     let pub_key_der = public_key.to_public_key_der()?.to_vec();
     let pub_key_der_for_hash = pub_key_der.clone();
@@ -230,6 +239,7 @@ async fn do_handshake(
     });
     write_raw_packet(&serialize_packet(&pkt)?, &mut write, None, &mut enc).await?;
 
+    // Encryption response
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let pkt = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
     let (enc_secret, enc_challenge) = match &pkt {
@@ -246,6 +256,7 @@ async fn do_handshake(
     dec = Some(Aes128CfbDec::new(&client_key.into(), &client_key.into()));
     enc = Some(Aes128CfbEnc::new(&client_key.into(), &client_key.into()));
 
+    // Mojang auth
     let server_hash = azalea_crypto::hex_digest(
         &azalea_crypto::digest_data(b"", &pub_key_der_for_hash, &shared_secret)
     );
@@ -275,18 +286,43 @@ async fn do_handshake(
         }),
     };
 
+    // Login finished
     let pkt = ClientboundLoginPacket::LoginFinished(ClientboundLoginFinished { game_profile });
     write_raw_packet(&serialize_packet(&pkt)?, &mut write, None, &mut enc).await?;
 
+    // Login ack
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let _ = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
 
+    let mut brand_data = Vec::new();
+    azalea_buf::AzBuf::azalea_write(&"PearlBot".to_string(), &mut brand_data)?;
+    let brand = ClientboundConfigPacket::CustomPayload(ClientboundCustomPayload {
+        identifier: "minecraft:brand".parse().unwrap(),
+        data: azalea_buf::UnsizedByteArray(brand_data),
+    });
+    write_raw_packet(&serialize_packet(&brand)?, &mut write, None, &mut enc).await?;
+
+    // Send finish configuration
+    let finish = ClientboundConfigPacket::FinishConfiguration(ClientboundFinishConfiguration);
+    write_raw_packet(&serialize_packet(&finish)?, &mut write, None, &mut enc).await?;
+
+    // Drain client config packets until finish configuration ack
+    loop {
+        let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
+        let pkt = deserialize_packet::<ServerboundConfigPacket>(&mut Cursor::new(&raw as &[u8]))?;
+        if let ServerboundConfigPacket::FinishConfiguration(_) = pkt {
+            break;
+        }
+    }
+
+    info!("Proxy: config state done, entering game bridge");
+
+    // Channels for game state bridging
     let (sb_tx, sb_rx) = mpsc::unbounded_channel::<Box<[u8]>>();
     let (cb_tx, cb_rx) = mpsc::unbounded_channel::<Box<[u8]>>();
     let disconnected = Arc::new(AtomicBool::new(false));
 
     let disc_w = disconnected.clone();
-    let key = client_key;
     tokio::spawn(async move {
         client_write_task(write, enc, cb_rx, disc_w).await;
     });
