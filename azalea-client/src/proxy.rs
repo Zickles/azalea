@@ -158,6 +158,7 @@ fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut R
             continue;
         }
         for raw in conn.take_tapped_packets() {
+            debug!("Proxy: forwarding game packet, id byte={:#x}, len={}", raw[0], raw.len());
             let _ = client.clientbound_tx.send(raw);
         }
     }
