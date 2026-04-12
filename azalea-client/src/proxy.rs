@@ -1,29 +1,27 @@
-use std::{
-    io::Cursor,
-    net::SocketAddr,
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
-};
+use std::{ io::Cursor, net::SocketAddr, sync::{ Arc, Mutex, atomic::{ AtomicBool, Ordering } } };
 
 use aes::Aes128;
 use azalea_crypto::Aes128CfbDec;
 use azalea_protocol::{
     packets::login::{
-        ClientboundHello, ClientboundLoginFinished, ClientboundLoginPacket,
+        ClientboundHello,
+        ClientboundLoginFinished,
+        ClientboundLoginPacket,
         ServerboundLoginPacket,
     },
     packets::handshake::ServerboundHandshakePacket,
-    read::{deserialize_packet, read_raw_packet},
-    write::{encode_to_network_packet, serialize_packet, write_raw_packet},
+    read::{ deserialize_packet, read_raw_packet },
+    write::{ encode_to_network_packet, serialize_packet, write_raw_packet },
 };
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey};
+use rsa::{ Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey };
 use tokio::{
     io::AsyncWriteExt,
-    net::{TcpListener, TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}},
+    net::{ TcpListener, TcpStream, tcp::{ OwnedReadHalf, OwnedWriteHalf } },
     sync::mpsc,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{ debug, error, info, warn };
 
 use crate::connection::RawConnection;
 
@@ -86,8 +84,12 @@ pub struct AttachedClient {
 }
 
 fn accept_client(state: Res<ProxyState>) {
-    let Ok(mut rx) = state.client_rx.try_lock() else { return };
-    let Ok(pending) = rx.try_recv() else { return };
+    let Ok(mut rx) = state.client_rx.try_lock() else {
+        return;
+    };
+    let Ok(pending) = rx.try_recv() else {
+        return;
+    };
 
     info!("Vanilla client attached");
 
@@ -98,12 +100,11 @@ fn accept_client(state: Res<ProxyState>) {
     });
 }
 
-fn forward_server_to_client(
-    state: Res<ProxyState>,
-    mut conn_query: Query<&mut RawConnection>,
-) {
+fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     let mut attached = state.attached.lock().unwrap();
-    let Some(client) = attached.as_mut() else { return };
+    let Some(client) = attached.as_mut() else {
+        return;
+    };
 
     if client.disconnected.load(Ordering::Relaxed) {
         info!("Vanilla client detached");
@@ -118,13 +119,14 @@ fn forward_server_to_client(
     }
 }
 
-fn forward_client_to_server(
-    state: Res<ProxyState>,
-    mut conn_query: Query<&mut RawConnection>,
-) {
+fn forward_client_to_server(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     let mut attached = state.attached.lock().unwrap();
-    let Some(client) = attached.as_mut() else { return };
-    let Ok(mut conn) = conn_query.single_mut() else { return };
+    let Some(client) = attached.as_mut() else {
+        return;
+    };
+    let Ok(mut conn) = conn_query.single_mut() else {
+        return;
+    };
 
     loop {
         match client.serverbound_rx.try_recv() {
@@ -136,7 +138,9 @@ fn forward_client_to_server(
                     }
                 }
             }
-            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                break;
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 *attached = None;
                 break;
@@ -149,10 +153,9 @@ async fn run_listener(
     bind_addr: SocketAddr,
     private_key: Arc<RsaPrivateKey>,
     public_key: Arc<RsaPublicKey>,
-    client_tx: mpsc::UnboundedSender<PendingClient>,
+    client_tx: mpsc::UnboundedSender<PendingClient>
 ) {
-    let listener = TcpListener::bind(bind_addr).await
-        .expect("ProxyPlugin: failed to bind");
+    let listener = TcpListener::bind(bind_addr).await.expect("ProxyPlugin: failed to bind");
     info!("ProxyPlugin listening on {bind_addr}");
 
     loop {
@@ -177,7 +180,7 @@ async fn do_handshake(
     stream: TcpStream,
     private_key: Arc<RsaPrivateKey>,
     public_key: RsaPublicKey,
-    client_tx: mpsc::UnboundedSender<PendingClient>,
+    client_tx: mpsc::UnboundedSender<PendingClient>
 ) -> anyhow::Result<()> {
     let (mut read, mut write) = stream.into_split();
     let mut buf = Cursor::new(Vec::new());
@@ -222,19 +225,23 @@ async fn do_handshake(
     dec = Some(Aes128CfbDec::new(&client_key.into(), &client_key.into()));
     enc = Some(Aes128CfbEnc::new(&client_key.into(), &client_key.into()));
 
-    let server_hash = azalea_crypto::hex_digest(&azalea_crypto::digest_data(
-        b"",
-        &pub_key_der_for_hash,
-        &shared_secret,
-    ));
+    let server_hash = azalea_crypto::hex_digest(
+        &azalea_crypto::digest_data(b"", &pub_key_der_for_hash, &shared_secret)
+    );
     let url = format!(
         "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={}&serverId={}",
-        username, server_hash
+        username,
+        server_hash
     );
+    info!("Proxy: checking hasJoined for username='{}' hash='{}'", username, server_hash);
     let resp = reqwest::get(&url).await?;
-    anyhow::ensure!(resp.status().as_u16() != 204, "Mojang auth failed");
-    let profile_json: serde_json::Value = resp.json().await?;
-    let uuid = uuid::Uuid::parse_str(profile_json["id"].as_str().unwrap_or(""))
+    let status = resp.status().as_u16();
+    let body = resp.text().await?;
+    info!("Proxy: hasJoined status={status} body={body}");
+    anyhow::ensure!(status != 204, "Mojang auth failed");
+    let profile_json: serde_json::Value = serde_json::from_str(&body)?;
+    let uuid = uuid::Uuid
+        ::parse_str(profile_json["id"].as_str().unwrap_or(""))
         .unwrap_or(profile_id);
     let name = profile_json["name"].as_str().unwrap_or(&username).to_string();
     info!("Proxy: authenticated {name}");
@@ -281,7 +288,7 @@ async fn client_write_task(
     mut write: OwnedWriteHalf,
     key: [u8; 16],
     mut rx: mpsc::UnboundedReceiver<Box<[u8]>>,
-    disconnected: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>
 ) {
     use aes::cipher::KeyIvInit;
     let mut enc: Option<Aes128CfbEnc> = Some(Aes128CfbEnc::new(&key.into(), &key.into()));
@@ -302,7 +309,7 @@ async fn client_read_task(
     mut dec: Option<Aes128CfbDec>,
     mut buf: Cursor<Vec<u8>>,
     tx: mpsc::UnboundedSender<Box<[u8]>>,
-    disconnected: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>
 ) {
     loop {
         match read_raw_packet(&mut read, &mut buf, None, &mut dec).await {
