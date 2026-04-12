@@ -54,27 +54,16 @@ impl Plugin for ProxyPlugin {
             client_rx: Mutex::new(client_rx),
         };
 
+        let bind_addr = self.bind_addr;
+        let handle = self.tokio_handle.clone();
+        std::thread::spawn(move || {
+            handle.spawn(run_listener(bind_addr, private_key, public_key, client_tx));
+        });
+
         app.insert_resource(state)
-            .insert_resource(ProxyListenerArgs {
-                bind_addr: self.bind_addr,
-                private_key,
-                public_key,
-                client_tx,
-                tokio_handle: self.tokio_handle.clone(),
-            })
-            .add_systems(Startup, start_listener)
             .add_systems(PreUpdate, (accept_client, forward_server_to_client).chain())
             .add_systems(PostUpdate, forward_client_to_server);
     }
-}
-
-#[derive(Resource)]
-struct ProxyListenerArgs {
-    bind_addr: SocketAddr,
-    private_key: Arc<RsaPrivateKey>,
-    public_key: Arc<RsaPublicKey>,
-    client_tx: mpsc::UnboundedSender<PendingClient>,
-    tokio_handle: tokio::runtime::Handle,
 }
 
 #[derive(Resource)]
@@ -94,17 +83,6 @@ pub struct AttachedClient {
     pub serverbound_rx: mpsc::UnboundedReceiver<Box<[u8]>>,
     pub clientbound_tx: mpsc::UnboundedSender<Box<[u8]>>,
     pub disconnected: Arc<AtomicBool>,
-}
-
-fn start_listener(mut commands: Commands, args: Res<ProxyListenerArgs>) {
-    let bind_addr = args.bind_addr;
-    let private_key = args.private_key.clone();
-    let public_key = args.public_key.as_ref().clone();
-    let client_tx = args.client_tx.clone();
-
-    args.tokio_handle.spawn(run_listener(bind_addr, private_key, public_key, client_tx));
-
-    commands.remove_resource::<ProxyListenerArgs>();
 }
 
 fn accept_client(state: Res<ProxyState>) {
@@ -170,7 +148,7 @@ fn forward_client_to_server(
 async fn run_listener(
     bind_addr: SocketAddr,
     private_key: Arc<RsaPrivateKey>,
-    public_key: RsaPublicKey,
+    public_key: Arc<RsaPublicKey>,
     client_tx: mpsc::UnboundedSender<PendingClient>,
 ) {
     let listener = TcpListener::bind(bind_addr).await
@@ -182,7 +160,7 @@ async fn run_listener(
             Ok((stream, addr)) => {
                 debug!("Proxy: client from {addr}");
                 let pk = private_key.clone();
-                let pubk = public_key.clone();
+                let pubk = public_key.as_ref().clone();
                 let tx = client_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = do_handshake(stream, pk, pubk, tx).await {
