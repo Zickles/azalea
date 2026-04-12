@@ -139,15 +139,14 @@ fn accept_client(state: Res<ProxyState>) {
     });
 }
 
-fn manage_config_buffer(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
-    let Ok(mut conn) = conn_query.single_mut()else {
+fn manage_config_buffer(state: Res<ProxyState>, conn_query: Query<&RawConnection>) {
+    let Ok(conn) = conn_query.single() else {
         return;
     };
 
     match conn.state {
         ConnectionProtocol::Configuration => {
             if state.config_locked.load(Ordering::Relaxed) {
-                // Bot reconnected, clear old buffer
                 state.config_packets.lock().unwrap().clear();
                 state.config_locked.store(false, Ordering::Relaxed);
                 info!("Proxy: config buffer cleared for reconnect");
@@ -155,25 +154,10 @@ fn manage_config_buffer(state: Res<ProxyState>, mut conn_query: Query<&mut RawCo
         }
         ConnectionProtocol::Game => {
             if !state.config_locked.load(Ordering::Relaxed) {
-                // Only lock if we actually have a FinishConfiguration in the buffer
-                let buf = state.config_packets.lock().unwrap();
-                let has_finish = buf
-                    .iter()
-                    .any(|raw| {
-                        matches!(
-                            deserialize_packet::<ClientboundConfigPacket>(
-                                &mut Cursor::new(raw as &[u8])
-                            ),
-                            Ok(ClientboundConfigPacket::FinishConfiguration(_))
-                        )
-                    });
-                drop(buf);
-                if has_finish {
-                    let count = state.config_packets.lock().unwrap().len();
-                    info!("Proxy: config buffer locked with {count} packets (complete)");
+                let count = state.config_packets.lock().unwrap().len();
+                if count > 0 {
+                    info!("Proxy: config buffer locked with {count} packets");
                     state.config_locked.store(true, Ordering::Relaxed);
-                } else {
-                    info!("Proxy: in game state but no FinishConfiguration in buffer, not locking");
                 }
             }
         }
