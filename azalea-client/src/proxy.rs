@@ -140,7 +140,7 @@ fn accept_client(state: Res<ProxyState>) {
 }
 
 fn manage_config_buffer(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
-    let Ok(mut conn) = conn_query.get_single_mut() else {
+    let Ok(mut conn) = conn_query.single_mut()else {
         return;
     };
 
