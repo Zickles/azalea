@@ -15,6 +15,7 @@ mod local_player;
 pub mod ping;
 mod player;
 mod plugins;
+pub mod proxy;
 pub mod raw_connection;
 
 #[doc(hidden)]
