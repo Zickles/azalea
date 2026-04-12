@@ -101,9 +101,8 @@ fn start_listener(mut commands: Commands, args: Res<ProxyListenerArgs>) {
     let public_key = args.public_key.as_ref().clone();
     let client_tx = args.client_tx.clone();
 
-    IoTaskPool::get()
-        .spawn(run_listener(bind_addr, private_key, public_key, client_tx))
-        .detach();
+    let handle = tokio::runtime::Handle::current();
+    handle.spawn(run_listener(bind_addr, private_key, public_key, client_tx));
 
     commands.remove_resource::<ProxyListenerArgs>();
 }
