@@ -3,13 +3,23 @@ use std::{ io::Cursor, net::SocketAddr, sync::{ Arc, Mutex, atomic::{ AtomicBool
 use aes::Aes128;
 use azalea_crypto::Aes128CfbDec;
 use azalea_protocol::{
-    packets::login::{
-        ClientboundHello,
-        ClientboundLoginFinished,
-        ClientboundLoginPacket,
-        ServerboundLoginPacket,
+    packets::{
+        ClientIntention,
+        PROTOCOL_VERSION,
+        handshake::ServerboundHandshakePacket,
+        login::{
+            ClientboundHello,
+            ClientboundLoginFinished,
+            ClientboundLoginPacket,
+            ServerboundLoginPacket,
+        },
+        status::{
+            ClientboundPongResponse,
+            ClientboundStatusPacket,
+            ClientboundStatusResponse,
+            ServerboundStatusPacket, c_status_response::{Players, Version},
+        },
     },
-    packets::handshake::ServerboundHandshakePacket,
     read::{ deserialize_packet, read_raw_packet },
     write::{ encode_to_network_packet, serialize_packet, write_raw_packet },
 };
@@ -84,8 +94,12 @@ pub struct AttachedClient {
 }
 
 fn accept_client(state: Res<ProxyState>) {
-    let Ok(mut rx) = state.client_rx.try_lock() else { return };
-    let Ok(pending) = rx.try_recv() else { return };
+    let Ok(mut rx) = state.client_rx.try_lock() else {
+        return;
+    };
+    let Ok(pending) = rx.try_recv() else {
+        return;
+    };
 
     info!("Vanilla client attached");
 
@@ -98,7 +112,9 @@ fn accept_client(state: Res<ProxyState>) {
 
 fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     let mut attached = state.attached.lock().unwrap();
-    let Some(client) = attached.as_mut() else { return };
+    let Some(client) = attached.as_mut() else {
+        return;
+    };
 
     if client.disconnected.load(Ordering::Relaxed) {
         info!("Vanilla client detached");
@@ -115,8 +131,12 @@ fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut R
 
 fn forward_client_to_server(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     let mut attached = state.attached.lock().unwrap();
-    let Some(client) = attached.as_mut() else { return };
-    let Ok(mut conn) = conn_query.single_mut() else { return };
+    let Some(client) = attached.as_mut() else {
+        return;
+    };
+    let Ok(mut conn) = conn_query.single_mut() else {
+        return;
+    };
 
     loop {
         match client.serverbound_rx.try_recv() {
@@ -128,7 +148,9 @@ fn forward_client_to_server(state: Res<ProxyState>, mut conn_query: Query<&mut R
                     }
                 }
             }
-            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                break;
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 *attached = None;
                 break;
@@ -141,7 +163,7 @@ async fn run_listener(
     bind_addr: SocketAddr,
     private_key: Arc<RsaPrivateKey>,
     public_key: Arc<RsaPublicKey>,
-    client_tx: mpsc::UnboundedSender<PendingClient>,
+    client_tx: mpsc::UnboundedSender<PendingClient>
 ) {
     let listener = TcpListener::bind(bind_addr).await.expect("ProxyPlugin: failed to bind");
     info!("ProxyPlugin listening on {bind_addr}");
@@ -168,7 +190,7 @@ async fn do_handshake(
     stream: TcpStream,
     private_key: Arc<RsaPrivateKey>,
     public_key: RsaPublicKey,
-    client_tx: mpsc::UnboundedSender<PendingClient>,
+    client_tx: mpsc::UnboundedSender<PendingClient>
 ) -> anyhow::Result<()> {
     let (mut read, mut write) = stream.into_split();
     let mut buf = Cursor::new(Vec::new());
@@ -176,7 +198,17 @@ async fn do_handshake(
     let mut enc: Option<Aes128CfbEnc> = None;
 
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
-    let _ = deserialize_packet::<ServerboundHandshakePacket>(&mut Cursor::new(&raw as &[u8]))?;
+    let handshake = deserialize_packet::<ServerboundHandshakePacket>(
+        &mut Cursor::new(&raw as &[u8])
+    )?;
+
+    let intention = match &handshake {
+        ServerboundHandshakePacket::Intention(p) => p.intention,
+    };
+
+    if intention == ClientIntention::Status {
+        return handle_status(&mut read, &mut write, &mut buf, &mut dec, &mut enc).await;
+    }
 
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let pkt = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
@@ -218,7 +250,8 @@ async fn do_handshake(
     );
     let url = format!(
         "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={}&serverId={}",
-        username, server_hash
+        username,
+        server_hash
     );
     info!("Proxy: checking hasJoined for username='{}' hash='{}'", username, server_hash);
     let resp = reqwest::get(&url).await?;
@@ -227,7 +260,8 @@ async fn do_handshake(
     info!("Proxy: hasJoined status={status} body={body}");
     anyhow::ensure!(status != 204, "Mojang auth failed");
     let profile_json: serde_json::Value = serde_json::from_str(&body)?;
-    let uuid = uuid::Uuid::parse_str(profile_json["id"].as_str().unwrap_or(""))
+    let uuid = uuid::Uuid
+        ::parse_str(profile_json["id"].as_str().unwrap_or(""))
         .unwrap_or(profile_id);
     let name = profile_json["name"].as_str().unwrap_or(&username).to_string();
     info!("Proxy: authenticated {name}");
@@ -271,11 +305,42 @@ async fn do_handshake(
     Ok(())
 }
 
+async fn handle_status(
+    read: &mut OwnedReadHalf,
+    write: &mut OwnedWriteHalf,
+    buf: &mut Cursor<Vec<u8>>,
+    dec: &mut Option<Aes128CfbDec>,
+    enc: &mut Option<Aes128CfbEnc>
+) -> anyhow::Result<()> {
+    let raw = read_raw_packet(read, buf, None, dec).await?;
+    let _ = deserialize_packet::<ServerboundStatusPacket>(&mut Cursor::new(&raw as &[u8]))?;
+
+    let pkt = ClientboundStatusPacket::StatusResponse(ClientboundStatusResponse {
+        description: azalea_chat::FormattedText::from("PearlBot"),
+        favicon: None,
+        players: Players { max: 1, online: 1, sample: vec![] },
+        version: Version { name: "26.1".to_string(), protocol: PROTOCOL_VERSION },
+        enforces_secure_chat: None,
+    });
+    write_raw_packet(&serialize_packet(&pkt)?, write, None, enc).await?;
+
+    let raw = read_raw_packet(read, buf, None, dec).await?;
+    let ping = deserialize_packet::<ServerboundStatusPacket>(&mut Cursor::new(&raw as &[u8]))?;
+    if let ServerboundStatusPacket::PingRequest(p) = ping {
+        let pong = ClientboundStatusPacket::PongResponse(ClientboundPongResponse {
+            time: p.time,
+        });
+        write_raw_packet(&serialize_packet(&pong)?, write, None, enc).await?;
+    }
+
+    Ok(())
+}
+
 async fn client_write_task(
     mut write: OwnedWriteHalf,
     key: [u8; 16],
     mut rx: mpsc::UnboundedReceiver<Box<[u8]>>,
-    disconnected: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>
 ) {
     use aes::cipher::KeyIvInit;
     let mut enc: Option<Aes128CfbEnc> = Some(Aes128CfbEnc::new(&key.into(), &key.into()));
@@ -296,7 +361,7 @@ async fn client_read_task(
     mut dec: Option<Aes128CfbDec>,
     mut buf: Cursor<Vec<u8>>,
     tx: mpsc::UnboundedSender<Box<[u8]>>,
-    disconnected: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>
 ) {
     loop {
         match read_raw_packet(&mut read, &mut buf, None, &mut dec).await {
