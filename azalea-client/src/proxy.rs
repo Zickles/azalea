@@ -229,6 +229,7 @@ async fn do_handshake(
     client_tx: mpsc::UnboundedSender<PendingClient>,
     config_packets: Arc<Mutex<Vec<Box<[u8]>>>>,
 ) -> anyhow::Result<()> {
+    stream.set_nodelay(true)?;
     let (mut read, mut write) = stream.into_split();
     let mut buf = Cursor::new(Vec::new());
     let mut dec: Option<Aes128CfbDec> = None;
