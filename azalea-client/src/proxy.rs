@@ -17,6 +17,7 @@ use azalea_protocol::{
 };
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_tasks::IoTaskPool;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey};
 use tokio::{
     io::AsyncWriteExt,
@@ -28,8 +29,6 @@ use tracing::{debug, error, info, warn};
 use crate::connection::RawConnection;
 
 pub type Aes128CfbEnc = cfb8::Encryptor<Aes128>;
-
-// ── Plugin ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct ProxyPlugin {
@@ -48,25 +47,33 @@ impl Plugin for ProxyPlugin {
 
         let mut rng = rand::rng();
         let private_key = Arc::new(RsaPrivateKey::new(&mut rng, 2048).unwrap());
-        let public_key = RsaPublicKey::from(private_key.as_ref());
+        let public_key = Arc::new(RsaPublicKey::from(private_key.as_ref()));
 
         let state = ProxyState {
             attached: Arc::new(Mutex::new(None)),
             client_rx: Mutex::new(client_rx),
         };
 
-        let bind_addr = self.bind_addr;
-        bevy_tasks::IoTaskPool::get()
-            .spawn(run_listener(bind_addr, private_key, public_key, client_tx))
-            .detach();
-
         app.insert_resource(state)
+            .insert_resource(ProxyListenerArgs {
+                bind_addr: self.bind_addr,
+                private_key,
+                public_key,
+                client_tx,
+            })
+            .add_systems(Startup, start_listener)
             .add_systems(PreUpdate, (accept_client, forward_server_to_client).chain())
             .add_systems(PostUpdate, forward_client_to_server);
     }
 }
 
-// ── Types ─────────────────────────────────────────────────────────────────────
+#[derive(Resource)]
+struct ProxyListenerArgs {
+    bind_addr: SocketAddr,
+    private_key: Arc<RsaPrivateKey>,
+    public_key: Arc<RsaPublicKey>,
+    client_tx: mpsc::UnboundedSender<PendingClient>,
+}
 
 #[derive(Resource)]
 pub struct ProxyState {
@@ -76,14 +83,9 @@ pub struct ProxyState {
 
 /// Handed off from the handshake task to ECS after login completes.
 pub struct PendingClient {
-    /// Raw decoded (decrypted+decompressed) serverbound packets from the client.
     pub serverbound_rx: mpsc::UnboundedReceiver<Box<[u8]>>,
-    /// Sender for raw decoded clientbound packets to forward to the client.
-    /// The write task handles re-encoding with the client's cipher.
     pub clientbound_tx: mpsc::UnboundedSender<Box<[u8]>>,
     pub disconnected: Arc<AtomicBool>,
-    /// The client's AES key — needed so we can re-encode outbound packets
-    /// with the client's own cipher, not the server's.
     pub client_enc_key: [u8; 16],
 }
 
@@ -93,7 +95,18 @@ pub struct AttachedClient {
     pub disconnected: Arc<AtomicBool>,
 }
 
-// ── ECS systems ───────────────────────────────────────────────────────────────
+fn start_listener(mut commands: Commands, args: Res<ProxyListenerArgs>) {
+    let bind_addr = args.bind_addr;
+    let private_key = args.private_key.clone();
+    let public_key = args.public_key.as_ref().clone();
+    let client_tx = args.client_tx.clone();
+
+    IoTaskPool::get()
+        .spawn(run_listener(bind_addr, private_key, public_key, client_tx))
+        .detach();
+
+    commands.remove_resource::<ProxyListenerArgs>();
+}
 
 fn accept_client(state: Res<ProxyState>) {
     let Ok(mut rx) = state.client_rx.try_lock() else { return };
@@ -123,8 +136,6 @@ fn forward_server_to_client(
 
     for mut conn in conn_query.iter_mut() {
         for raw in conn.take_tapped_packets() {
-            // raw is already decrypted+decompressed packet bytes.
-            // The write task in do_handshake will re-encode with the client cipher.
             let _ = client.clientbound_tx.send(raw);
         }
     }
@@ -142,7 +153,6 @@ fn forward_client_to_server(
         match client.serverbound_rx.try_recv() {
             Ok(raw) => {
                 if let Some(net) = conn.net_conn() {
-                    // write_raw handles compression+encryption for the server side
                     if let Err(e) = net.write_raw(&raw) {
                         error!("Proxy: server write failed: {e}");
                         break;
@@ -157,8 +167,6 @@ fn forward_client_to_server(
         }
     }
 }
-
-// ── Listener + handshake ──────────────────────────────────────────────────────
 
 async fn run_listener(
     bind_addr: SocketAddr,
@@ -235,7 +243,7 @@ async fn do_handshake(
     let decrypted_challenge = private_key.decrypt(Pkcs1v15Encrypt, &enc_challenge)?;
     anyhow::ensure!(decrypted_challenge == verify_token, "challenge mismatch");
 
-    // Enable encryption with the CLIENT's key
+    // Enable encryption with the client's key
     use aes::cipher::KeyIvInit;
     let client_key: [u8; 16] = shared_secret.as_slice().try_into()?;
     dec = Some(Aes128CfbDec::new(&client_key.into(), &client_key.into()));
@@ -259,8 +267,7 @@ async fn do_handshake(
     let name = profile_json["name"].as_str().unwrap_or(&username).to_string();
     info!("Proxy: authenticated {name}");
 
-    // Login success — send back the client's own profile
-    // (they expect to see their own UUID/name, not the bot's)
+    // Login success — send the connecting client their own profile back
     let game_profile = azalea_auth::game_profile::GameProfile {
         uuid,
         name,
@@ -280,14 +287,12 @@ async fn do_handshake(
     let (cb_tx, cb_rx) = mpsc::unbounded_channel::<Box<[u8]>>();
     let disconnected = Arc::new(AtomicBool::new(false));
 
-    // Write task: takes decoded packet bytes, re-encodes with CLIENT cipher, writes to TCP
     let disc_w = disconnected.clone();
     let key = client_key;
     tokio::spawn(async move {
         client_write_task(write, key, cb_rx, disc_w).await;
     });
 
-    // Read task: reads from client TCP, decrypts with CLIENT cipher, sends decoded bytes
     let disc_r = disconnected.clone();
     tokio::spawn(async move {
         client_read_task(read, dec, buf, sb_tx, disc_r).await;
@@ -303,8 +308,6 @@ async fn do_handshake(
     Ok(())
 }
 
-/// Receives raw decoded packet bytes, re-encodes them with the client's AES
-/// cipher (no compression), and writes to the TCP stream.
 async fn client_write_task(
     mut write: OwnedWriteHalf,
     key: [u8; 16],
@@ -312,16 +315,13 @@ async fn client_write_task(
     disconnected: Arc<AtomicBool>,
 ) {
     use aes::cipher::KeyIvInit;
-    // Fresh enc cipher — owned by this task, never shared
     let mut enc: Option<Aes128CfbEnc> =
         Some(Aes128CfbEnc::new(&key.into(), &key.into()));
 
     while let Some(raw_packet) = rx.recv().await {
-        // encode_to_network_packet: prepends varint length, optionally compresses,
-        // then encrypts. We pass compression=None and our client enc cipher.
         let network_bytes = encode_to_network_packet(
             &raw_packet,
-            None,          // no compression to client
+            None,
             &mut enc,
         );
         if let Err(e) = write.write_all(&network_bytes).await {
@@ -333,8 +333,6 @@ async fn client_write_task(
     disconnected.store(true, Ordering::Relaxed);
 }
 
-/// Reads from the client TCP stream, decrypts with the client's cipher,
-/// and sends raw decoded packet bytes upstream to the ECS.
 async fn client_read_task(
     mut read: OwnedReadHalf,
     mut dec: Option<Aes128CfbDec>,
@@ -343,8 +341,6 @@ async fn client_read_task(
     disconnected: Arc<AtomicBool>,
 ) {
     loop {
-        // read_raw_packet handles varint framing + decryption + decompression.
-        // We pass compression=None because the client never compresses to us.
         match read_raw_packet(&mut read, &mut buf, None, &mut dec).await {
             Ok(raw) => {
                 if tx.send(raw).is_err() {
