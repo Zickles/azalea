@@ -5,7 +5,6 @@ use azalea_crypto::Aes128CfbDec;
 use azalea_protocol::{
     packets::login::{
         ClientboundHello,
-        ClientboundLoginCompression,
         ClientboundLoginFinished,
         ClientboundLoginPacket,
         ServerboundLoginPacket,
@@ -27,8 +26,6 @@ use tracing::{ debug, error, info, warn };
 use crate::connection::RawConnection;
 
 pub type Aes128CfbEnc = cfb8::Encryptor<Aes128>;
-
-const CLIENT_COMPRESSION: u32 = 256;
 
 #[derive(Clone)]
 pub struct ProxyPlugin {
@@ -243,23 +240,10 @@ async fn do_handshake(
         }),
     };
 
-    // Send compression before login finished so client expects compressed packets
-    let compression_pkt = ClientboundLoginPacket::LoginCompression(ClientboundLoginCompression {
-        compression_threshold: CLIENT_COMPRESSION as i32,
-    });
-    write_raw_packet(&serialize_packet(&compression_pkt)?, &mut write, None, &mut enc).await?;
-
-    // Login finished is sent with compression now active
     let pkt = ClientboundLoginPacket::LoginFinished(ClientboundLoginFinished { game_profile });
-    write_raw_packet(
-        &serialize_packet(&pkt)?,
-        &mut write,
-        Some(CLIENT_COMPRESSION),
-        &mut enc,
-    ).await?;
+    write_raw_packet(&serialize_packet(&pkt)?, &mut write, None, &mut enc).await?;
 
-    // Login ack — client sends this compressed
-    let raw = read_raw_packet(&mut read, &mut buf, Some(CLIENT_COMPRESSION), &mut dec).await?;
+    let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let _ = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
 
     let (sb_tx, sb_rx) = mpsc::unbounded_channel::<Box<[u8]>>();
@@ -287,7 +271,6 @@ async fn do_handshake(
     Ok(())
 }
 
-// Receives decoded packet bytes from the tap, re-encodes with client cipher + compression
 async fn client_write_task(
     mut write: OwnedWriteHalf,
     key: [u8; 16],
@@ -298,7 +281,7 @@ async fn client_write_task(
     let mut enc: Option<Aes128CfbEnc> = Some(Aes128CfbEnc::new(&key.into(), &key.into()));
 
     while let Some(raw_packet) = rx.recv().await {
-        let network_bytes = encode_to_network_packet(&raw_packet, Some(CLIENT_COMPRESSION), &mut enc);
+        let network_bytes = encode_to_network_packet(&raw_packet, None, &mut enc);
         if let Err(e) = write.write_all(&network_bytes).await {
             debug!("Proxy: client write ended: {e}");
             break;
@@ -308,7 +291,6 @@ async fn client_write_task(
     disconnected.store(true, Ordering::Relaxed);
 }
 
-// Reads from client TCP, decrypts + decompresses, sends decoded bytes upstream
 async fn client_read_task(
     mut read: OwnedReadHalf,
     mut dec: Option<Aes128CfbDec>,
@@ -317,7 +299,7 @@ async fn client_read_task(
     disconnected: Arc<AtomicBool>,
 ) {
     loop {
-        match read_raw_packet(&mut read, &mut buf, Some(CLIENT_COMPRESSION), &mut dec).await {
+        match read_raw_packet(&mut read, &mut buf, None, &mut dec).await {
             Ok(raw) => {
                 if tx.send(raw).is_err() {
                     break;
