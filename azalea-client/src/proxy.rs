@@ -1,21 +1,23 @@
-use std::{
-    collections::HashSet,
-    io::Cursor,
-    net::SocketAddr,
-    sync::{ Arc, Mutex, atomic::{ AtomicBool, Ordering } },
-};
+use std::{ io::Cursor, net::SocketAddr, sync::{ Arc, Mutex, atomic::{ AtomicBool, Ordering } } };
 
 use aes::Aes128;
+use azalea_core::{ entity_id::MinecraftEntityId, game_type::{ GameMode, OptionalGameType } };
 use azalea_crypto::Aes128CfbDec;
+use azalea_entity::{ LookDirection, Position };
 use azalea_protocol::{
+    common::movements::{ PositionMoveRotation, RelativeMovements },
     packets::{
         ClientIntention,
         ConnectionProtocol,
         PROTOCOL_VERSION,
-        config::{
-            ClientboundConfigPacket,
-            ClientboundFinishConfiguration,
-            ServerboundConfigPacket,
+        common::CommonPlayerSpawnInfo,
+        config::{ ClientboundFinishConfiguration, ServerboundConfigPacket },
+        game::{
+            ClientboundGameEvent,
+            ClientboundGamePacket,
+            ClientboundLogin,
+            ClientboundPlayerPosition,
+            c_game_event::EventType,
         },
         handshake::ServerboundHandshakePacket,
         login::{
@@ -35,6 +37,8 @@ use azalea_protocol::{
     read::{ deserialize_packet, read_raw_packet },
     write::{ encode_to_network_packet, serialize_packet, write_raw_packet },
 };
+use azalea_registry::{ DataRegistry, data::{ DimensionKind, DimensionKindKey }, identifier::Identifier };
+use azalea_world::WorldName;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use rsa::{ Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey, pkcs8::EncodePublicKey };
@@ -45,9 +49,22 @@ use tokio::{
 };
 use tracing::{ debug, error, info, warn };
 
-use crate::connection::RawConnection;
+use crate::{ connection::RawConnection, local_player::{ LocalGameMode, WorldHolder } };
 
 pub type Aes128CfbEnc = cfb8::Encryptor<Aes128>;
+
+/// Snapshot of the bot's game state, shared between ECS and the async handshake task.
+#[derive(Clone, Debug)]
+pub struct CachedGameState {
+    pub player_id: MinecraftEntityId,
+    pub game_mode: GameMode,
+    pub dimension_type: u32,
+    pub dimension: Identifier,
+    pub seed: i64,
+    pub position: azalea_core::position::Vec3,
+    pub y_rot: f32,
+    pub x_rot: f32,
+}
 
 #[derive(Clone)]
 pub struct ProxyPlugin {
@@ -69,33 +86,24 @@ impl Plugin for ProxyPlugin {
         let private_key = Arc::new(RsaPrivateKey::new(&mut rng, 2048).unwrap());
         let public_key = Arc::new(RsaPublicKey::from(private_key.as_ref()));
 
-        let config_packets: Arc<Mutex<Vec<Box<[u8]>>>> = Arc::new(Mutex::new(Vec::new()));
-        let config_locked = Arc::new(AtomicBool::new(false));
+        let game_state: Arc<Mutex<Option<CachedGameState>>> = Arc::new(Mutex::new(None));
 
         let state = ProxyState {
             attached: Arc::new(Mutex::new(None)),
             client_rx: Mutex::new(client_rx),
-            config_packets: config_packets.clone(),
-            config_locked: config_locked.clone(),
+            game_state: game_state.clone(),
         };
 
         let bind_addr = self.bind_addr;
         let handle = self.tokio_handle.clone();
         std::thread::spawn(move || {
-            handle.spawn(
-                run_listener(bind_addr, private_key, public_key, client_tx, config_packets)
-            );
+            handle.spawn(run_listener(bind_addr, private_key, public_key, client_tx, game_state));
         });
 
         app.insert_resource(state)
             .add_systems(
                 PreUpdate,
-                (
-                    accept_client,
-                    manage_config_buffer,
-                    buffer_config_packets,
-                    forward_server_to_client,
-                ).chain()
+                (accept_client, cache_game_state, forward_server_to_client).chain()
             )
             .add_systems(PostUpdate, forward_client_to_server);
     }
@@ -105,15 +113,13 @@ impl Plugin for ProxyPlugin {
 pub struct ProxyState {
     pub attached: Arc<Mutex<Option<AttachedClient>>>,
     client_rx: Mutex<mpsc::UnboundedReceiver<PendingClient>>,
-    pub config_packets: Arc<Mutex<Vec<Box<[u8]>>>>,
-    config_locked: Arc<AtomicBool>,
+    pub game_state: Arc<Mutex<Option<CachedGameState>>>,
 }
 
 pub struct PendingClient {
     pub serverbound_rx: mpsc::UnboundedReceiver<Box<[u8]>>,
     pub clientbound_tx: mpsc::UnboundedSender<Box<[u8]>>,
     pub disconnected: Arc<AtomicBool>,
-    pub client_enc_key: [u8; 16],
 }
 
 pub struct AttachedClient {
@@ -129,9 +135,7 @@ fn accept_client(state: Res<ProxyState>) {
     let Ok(pending) = rx.try_recv() else {
         return;
     };
-
     info!("Vanilla client attached");
-
     *state.attached.lock().unwrap() = Some(AttachedClient {
         serverbound_rx: pending.serverbound_rx,
         clientbound_tx: pending.clientbound_tx,
@@ -139,51 +143,29 @@ fn accept_client(state: Res<ProxyState>) {
     });
 }
 
-fn manage_config_buffer(state: Res<ProxyState>, conn_query: Query<&RawConnection>) {
-    let Ok(conn) = conn_query.single() else {
+fn cache_game_state(
+    state: Res<ProxyState>,
+    query: Query<(&MinecraftEntityId, &LocalGameMode, &WorldName, &Position, &LookDirection)>
+) {
+    let Ok((entity_id, game_mode, world_name, position, look)) = query.single() else {
         return;
     };
 
-    match conn.state {
-        ConnectionProtocol::Configuration => {
-            if state.config_locked.load(Ordering::Relaxed) {
-                state.config_packets.lock().unwrap().clear();
-                state.config_locked.store(false, Ordering::Relaxed);
-                info!("Proxy: config buffer cleared for reconnect");
-            }
-        }
-        ConnectionProtocol::Game => {
-            if !state.config_locked.load(Ordering::Relaxed) {
-                let count = state.config_packets.lock().unwrap().len();
-                if count > 0 {
-                    info!("Proxy: config buffer locked with {count} packets");
-                    state.config_locked.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-        _ => {}
-    }
-}
+    let dim_str = world_name.0.to_string();
+    let dimension_type: u32 = if dim_str.contains("nether") { 3 } 
+    else if dim_str.contains("end") { 2 } 
+    else { 0 };
 
-fn buffer_config_packets(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
-    for mut conn in conn_query.iter_mut() {
-        let tapped = conn.take_tapped_packets();
-        if tapped.is_empty() {
-            continue;
-        }
-
-        if
-            conn.state != ConnectionProtocol::Configuration ||
-            state.config_locked.load(Ordering::Relaxed)
-        {
-            continue;
-        }
-
-        let mut buf = state.config_packets.lock().unwrap();
-        for raw in tapped {
-            buf.push(raw);
-        }
-    }
+    *state.game_state.lock().unwrap() = Some(CachedGameState {
+        player_id: *entity_id,
+        game_mode: game_mode.current,
+        dimension_type,
+        dimension: world_name.0.clone(),
+        seed: 0,
+        position: **position,
+        y_rot: look.y_rot(),
+        x_rot: look.x_rot(),
+    });
 }
 
 fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
@@ -248,7 +230,7 @@ async fn run_listener(
     private_key: Arc<RsaPrivateKey>,
     public_key: Arc<RsaPublicKey>,
     client_tx: mpsc::UnboundedSender<PendingClient>,
-    config_packets: Arc<Mutex<Vec<Box<[u8]>>>>
+    game_state: Arc<Mutex<Option<CachedGameState>>>
 ) {
     let listener = TcpListener::bind(bind_addr).await.expect("ProxyPlugin: failed to bind");
     info!("ProxyPlugin listening on {bind_addr}");
@@ -260,9 +242,9 @@ async fn run_listener(
                 let pk = private_key.clone();
                 let pubk = public_key.as_ref().clone();
                 let tx = client_tx.clone();
-                let cfg = config_packets.clone();
+                let gs = game_state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = do_handshake(stream, pk, pubk, tx, cfg).await {
+                    if let Err(e) = do_handshake(stream, pk, pubk, tx, gs).await {
                         warn!("Proxy handshake error: {e}");
                     }
                 });
@@ -277,7 +259,7 @@ async fn do_handshake(
     private_key: Arc<RsaPrivateKey>,
     public_key: RsaPublicKey,
     client_tx: mpsc::UnboundedSender<PendingClient>,
-    config_packets: Arc<Mutex<Vec<Box<[u8]>>>>
+    game_state: Arc<Mutex<Option<CachedGameState>>>
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
     let (mut read, mut write) = stream.into_split();
@@ -285,19 +267,19 @@ async fn do_handshake(
     let mut dec: Option<Aes128CfbDec> = None;
     let mut enc: Option<Aes128CfbEnc> = None;
 
+    // Handshake
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let handshake = deserialize_packet::<ServerboundHandshakePacket>(
         &mut Cursor::new(&raw as &[u8])
     )?;
-
     let intention = match &handshake {
         ServerboundHandshakePacket::Intention(p) => p.intention,
     };
-
     if intention == ClientIntention::Status {
         return handle_status(&mut read, &mut write, &mut buf, &mut dec, &mut enc).await;
     }
 
+    // Login Hello
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let pkt = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
     let (username, profile_id) = match &pkt {
@@ -309,14 +291,21 @@ async fn do_handshake(
     let pub_key_der = public_key.to_public_key_der()?.to_vec();
     let pub_key_der_for_hash = pub_key_der.clone();
 
-    let pkt = ClientboundLoginPacket::Hello(ClientboundHello {
-        server_id: "".to_string(),
-        public_key: pub_key_der,
-        challenge: verify_token.to_vec(),
-        should_authenticate: true,
-    });
-    write_raw_packet(&serialize_packet(&pkt)?, &mut write, None, &mut enc).await?;
+    write_raw_packet(
+        &serialize_packet(
+            &ClientboundLoginPacket::Hello(ClientboundHello {
+                server_id: "".to_string(),
+                public_key: pub_key_der,
+                challenge: verify_token.to_vec(),
+                should_authenticate: true,
+            })
+        )?,
+        &mut write,
+        None,
+        &mut enc
+    ).await?;
 
+    // Login Key
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let pkt = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
     let (enc_secret, enc_challenge) = match &pkt {
@@ -333,20 +322,20 @@ async fn do_handshake(
     dec = Some(Aes128CfbDec::new(&client_key.into(), &client_key.into()));
     enc = Some(Aes128CfbEnc::new(&client_key.into(), &client_key.into()));
 
+    // Mojang auth
     let server_hash = azalea_crypto::hex_digest(
         &azalea_crypto::digest_data(b"", &pub_key_der_for_hash, &shared_secret)
     );
-    let url = format!(
-        "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={}&serverId={}",
-        username,
-        server_hash
-    );
     info!("Proxy: checking hasJoined for username='{}' hash='{}'", username, server_hash);
-    let resp = reqwest::get(&url).await?;
-    let status = resp.status().as_u16();
+    let resp = reqwest::get(
+        format!(
+            "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={}&serverId={}",
+            username,
+            server_hash
+        )
+    ).await?;
+    anyhow::ensure!(resp.status().as_u16() != 204, "Mojang auth failed");
     let body = resp.text().await?;
-    info!("Proxy: hasJoined status={status}");
-    anyhow::ensure!(status != 204, "Mojang auth failed");
     let profile_json: serde_json::Value = serde_json::from_str(&body)?;
     let uuid = uuid::Uuid
         ::parse_str(profile_json["id"].as_str().unwrap_or(""))
@@ -362,45 +351,34 @@ async fn do_handshake(
         }),
     };
 
-    let pkt = ClientboundLoginPacket::LoginFinished(ClientboundLoginFinished { game_profile });
-    write_raw_packet(&serialize_packet(&pkt)?, &mut write, None, &mut enc).await?;
+    write_raw_packet(
+        &serialize_packet(
+            &ClientboundLoginPacket::LoginFinished(ClientboundLoginFinished { game_profile })
+        )?,
+        &mut write,
+        None,
+        &mut enc
+    ).await?;
 
+    // LoginAck
     let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
     let _ = deserialize_packet::<ServerboundLoginPacket>(&mut Cursor::new(&raw as &[u8]))?;
 
-    // Replay config packets — deduplicate registry data, skip FinishConfiguration
-    let replayed = config_packets.lock().unwrap().clone();
-    info!("Proxy: replaying {} config packets to client", replayed.len());
-    let mut forwarded = 0usize;
-    let mut seen_registries: HashSet<String> = HashSet::new();
-    for raw in &replayed {
-        match deserialize_packet::<ClientboundConfigPacket>(&mut Cursor::new(raw as &[u8])) {
-            Ok(pkt) => {
-                match &pkt {
-                    ClientboundConfigPacket::FinishConfiguration(_) => {
-                        continue;
-                    }
-                    ClientboundConfigPacket::RegistryData(p) => {
-                        let key = p.registry_id.to_string();
-                        if !seen_registries.insert(key) {
-                            continue;
-                        }
-                    }
-                    _ => {}
-                }
-                write_raw_packet(raw, &mut write, None, &mut enc).await?;
-                forwarded += 1;
-            }
-            Err(e) => {
-                debug!("Proxy: skipping packet in replay, deserialize error: {e}");
-            }
-        }
-    }
-    info!("Proxy: forwarded {forwarded} valid config packets");
+    // Config: send FinishConfiguration immediately, skip registry replay entirely.
+    // The client has all vanilla registries built in — no need to send them.
+    info!("Proxy: sending immediate FinishConfiguration");
+    write_raw_packet(
+        &serialize_packet(
+            &azalea_protocol::packets::config::ClientboundConfigPacket::FinishConfiguration(
+                ClientboundFinishConfiguration
+            )
+        )?,
+        &mut write,
+        None,
+        &mut enc
+    ).await?;
 
-    let finish = ClientboundConfigPacket::FinishConfiguration(ClientboundFinishConfiguration);
-    write_raw_packet(&serialize_packet(&finish)?, &mut write, None, &mut enc).await?;
-
+    // Wait for client FinishConfiguration ack
     loop {
         let raw = read_raw_packet(&mut read, &mut buf, None, &mut dec).await?;
         let pkt = deserialize_packet::<ServerboundConfigPacket>(&mut Cursor::new(&raw as &[u8]))?;
@@ -409,7 +387,83 @@ async fn do_handshake(
         }
     }
 
-    info!("Proxy: config state done, entering game bridge");
+    // Get cached game state — must be present (bot is in game)
+    let gs = game_state.lock().unwrap().clone();
+    let Some(gs) = gs else {
+        anyhow::bail!("bot not in game state, cannot synthesize login");
+    };
+
+    info!("Proxy: synthesizing login at {:?}", gs.position);
+
+    // ClientboundLogin
+    write_raw_packet(
+        &serialize_packet(
+            &ClientboundGamePacket::Login(ClientboundLogin {
+                player_id: gs.player_id,
+                hardcore: false,
+                levels: vec![
+                    "minecraft:overworld".parse::<Identifier>().unwrap(),
+                    "minecraft:the_nether".parse::<Identifier>().unwrap(),
+                    "minecraft:the_end".parse::<Identifier>().unwrap()
+                ],
+                max_players: 100,
+                chunk_radius: 8,
+                simulation_distance: 8,
+                reduced_debug_info: false,
+                show_death_screen: true,
+                do_limited_crafting: false,
+                common: CommonPlayerSpawnInfo {
+                    dimension_type: DimensionKind::new_raw(gs.dimension_type),
+                    dimension: gs.dimension.clone(),
+                    seed: gs.seed,
+                    game_type: gs.game_mode,
+                    previous_game_type: OptionalGameType(None),
+                    is_debug: false,
+                    is_flat: false,
+                    last_death_location: None,
+                    portal_cooldown: 0,
+                    sea_level: 63,
+                },
+                enforces_secure_chat: false,
+            })
+        )?,
+        &mut write,
+        None,
+        &mut enc
+    ).await?;
+
+    // WaitForLevelChunks
+    write_raw_packet(
+        &serialize_packet(
+            &ClientboundGamePacket::GameEvent(ClientboundGameEvent {
+                event: EventType::WaitForLevelChunks,
+                param: 0.0,
+            })
+        )?,
+        &mut write,
+        None,
+        &mut enc
+    ).await?;
+
+    // Player position
+    write_raw_packet(
+        &serialize_packet(
+            &ClientboundGamePacket::PlayerPosition(ClientboundPlayerPosition {
+                id: 0,
+                change: PositionMoveRotation {
+                    pos: gs.position,
+                    delta: azalea_core::position::Vec3::ZERO,
+                    look_direction: LookDirection::new(gs.y_rot, gs.x_rot),
+                },
+                relative: RelativeMovements::default(),
+            })
+        )?,
+        &mut write,
+        None,
+        &mut enc
+    ).await?;
+
+    info!("Proxy: synthetic join complete, entering game bridge");
 
     let (sb_tx, sb_rx) = mpsc::unbounded_channel::<Box<[u8]>>();
     let (cb_tx, cb_rx) = mpsc::unbounded_channel::<Box<[u8]>>();
@@ -419,18 +473,13 @@ async fn do_handshake(
         serverbound_rx: sb_rx,
         clientbound_tx: cb_tx,
         disconnected: disconnected.clone(),
-        client_enc_key: client_key,
     })?;
 
     let disc_w = disconnected.clone();
-    tokio::spawn(async move {
-        client_write_task(write, enc, cb_rx, disc_w).await;
-    });
+    tokio::spawn(async move { client_write_task(write, enc, cb_rx, disc_w).await });
 
     let disc_r = disconnected.clone();
-    tokio::spawn(async move {
-        client_read_task(read, dec, buf, sb_tx, disc_r).await;
-    });
+    tokio::spawn(async move { client_read_task(read, dec, buf, sb_tx, disc_r).await });
 
     Ok(())
 }
@@ -445,20 +494,32 @@ async fn handle_status(
     let raw = read_raw_packet(read, buf, None, dec).await?;
     let _ = deserialize_packet::<ServerboundStatusPacket>(&mut Cursor::new(&raw as &[u8]))?;
 
-    let pkt = ClientboundStatusPacket::StatusResponse(ClientboundStatusResponse {
-        description: azalea_chat::FormattedText::from("PearlBot"),
-        favicon: None,
-        players: Players { max: 1, online: 1, sample: vec![] },
-        version: Version { name: "26.1".to_string(), protocol: PROTOCOL_VERSION },
-        enforces_secure_chat: None,
-    });
-    write_raw_packet(&serialize_packet(&pkt)?, write, None, enc).await?;
+    write_raw_packet(
+        &serialize_packet(
+            &ClientboundStatusPacket::StatusResponse(ClientboundStatusResponse {
+                description: azalea_chat::FormattedText::from("PearlBot"),
+                favicon: None,
+                players: Players { max: 1, online: 1, sample: vec![] },
+                version: Version { name: "26.1".to_string(), protocol: PROTOCOL_VERSION },
+                enforces_secure_chat: None,
+            })
+        )?,
+        write,
+        None,
+        enc
+    ).await?;
 
     let raw = read_raw_packet(read, buf, None, dec).await?;
     let ping = deserialize_packet::<ServerboundStatusPacket>(&mut Cursor::new(&raw as &[u8]))?;
     if let ServerboundStatusPacket::PingRequest(p) = ping {
-        let pong = ClientboundStatusPacket::PongResponse(ClientboundPongResponse { time: p.time });
-        write_raw_packet(&serialize_packet(&pong)?, write, None, enc).await?;
+        write_raw_packet(
+            &serialize_packet(
+                &ClientboundStatusPacket::PongResponse(ClientboundPongResponse { time: p.time })
+            )?,
+            write,
+            None,
+            enc
+        ).await?;
     }
 
     Ok(())
