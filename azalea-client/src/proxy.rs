@@ -17,7 +17,8 @@ use azalea_protocol::{
             ClientboundPongResponse,
             ClientboundStatusPacket,
             ClientboundStatusResponse,
-            ServerboundStatusPacket, c_status_response::{Players, Version},
+            ServerboundStatusPacket,
+            c_status_response::{ Players, Version },
         },
     },
     read::{ deserialize_packet, read_raw_packet },
@@ -287,7 +288,7 @@ async fn do_handshake(
     let disc_w = disconnected.clone();
     let key = client_key;
     tokio::spawn(async move {
-        client_write_task(write, key, cb_rx, disc_w).await;
+        client_write_task(write, enc, cb_rx, disc_w).await;
     });
 
     let disc_r = disconnected.clone();
@@ -338,13 +339,10 @@ async fn handle_status(
 
 async fn client_write_task(
     mut write: OwnedWriteHalf,
-    key: [u8; 16],
+    mut enc: Option<Aes128CfbEnc>,
     mut rx: mpsc::UnboundedReceiver<Box<[u8]>>,
     disconnected: Arc<AtomicBool>
 ) {
-    use aes::cipher::KeyIvInit;
-    let mut enc: Option<Aes128CfbEnc> = Some(Aes128CfbEnc::new(&key.into(), &key.into()));
-
     while let Some(raw_packet) = rx.recv().await {
         let network_bytes = encode_to_network_packet(&raw_packet, None, &mut enc);
         if let Err(e) = write.write_all(&network_bytes).await {
@@ -352,7 +350,6 @@ async fn client_write_task(
             break;
         }
     }
-
     disconnected.store(true, Ordering::Relaxed);
 }
 
