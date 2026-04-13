@@ -504,11 +504,13 @@ async fn do_handshake(
                     // Skip ViaProxy's version if we have vanilla data — ViaProxy may send
                     // incompatible formats for registries that changed between versions.
                     if vanilla_registry_names.contains(&reg_id) {
+                        info!("Proxy: skipping ViaProxy registry {reg_id}, using vanilla data");
                         continue;
                     }
-                    if !seen_registries.insert(reg_id) {
+                    if !seen_registries.insert(reg_id.clone()) {
                         continue;
                     }
+                    info!("Proxy: forwarding ViaProxy registry {reg_id}");
                 }
                 _ => {}
             }
