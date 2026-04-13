@@ -701,11 +701,18 @@ async fn do_handshake(
     let cached_game = game_packets.lock().unwrap().drain(..).collect::<Vec<_>>();
     let mut game_replayed = 0usize;
     for raw in &cached_game {
-        if let Ok(ClientboundGamePacket::StartConfiguration(_)) =
-            deserialize_packet::<ClientboundGamePacket>(&mut Cursor::new(raw as &[u8]))
-        {
-            info!("Proxy: skipping StartConfiguration in game packet replay");
-            continue;
+        if let Ok(pkt) = deserialize_packet::<ClientboundGamePacket>(&mut Cursor::new(raw as &[u8])) {
+            match &pkt {
+                // Skip packets that would cause state transitions or conflict
+                // with the synthetic login we already sent.
+                ClientboundGamePacket::StartConfiguration(_) |
+                ClientboundGamePacket::Login(_) |
+                ClientboundGamePacket::Respawn(_) => {
+                    info!("Proxy: skipping {:?} in game packet replay", std::mem::discriminant(&pkt));
+                    continue;
+                }
+                _ => {}
+            }
         }
         write_raw_packet(raw, &mut write, None, &mut enc).await?;
         game_replayed += 1;
