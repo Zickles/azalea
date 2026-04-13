@@ -695,30 +695,10 @@ async fn do_handshake(
         &mut enc
     ).await?;
 
-    // Replay all cached game packets (chunks, inventory, entities, etc.)
-    // Filter out StartConfiguration packets — the bot may have gone through re-config,
-    // and replaying StartConfiguration would put the client into config mode where
-    // subsequent game packets get misinterpreted (packet IDs are reused across states).
-    let cached_game = game_packets.lock().unwrap().drain(..).collect::<Vec<_>>();
-    let mut game_replayed = 0usize;
-    for raw in &cached_game {
-        if let Ok(pkt) = deserialize_packet::<ClientboundGamePacket>(&mut Cursor::new(raw as &[u8])) {
-            match &pkt {
-                // Skip packets that would cause state transitions or conflict
-                // with the synthetic login we already sent.
-                ClientboundGamePacket::StartConfiguration(_) |
-                ClientboundGamePacket::Login(_) |
-                ClientboundGamePacket::Respawn(_) => {
-                    info!("Proxy: skipping {:?} in game packet replay", std::mem::discriminant(&pkt));
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        write_raw_packet(raw, &mut write, None, &mut enc).await?;
-        game_replayed += 1;
-    }
-    info!("Proxy: replayed {game_replayed}/{} cached game packets", cached_game.len());
+    // Game packet replay disabled for now — ViaProxy's translated packets may not
+    // be fully compatible with the vanilla 26.1 client.
+    let cached_count = game_packets.lock().unwrap().drain(..).count();
+    info!("Proxy: skipped {cached_count} cached game packets (replay disabled)");
 
     info!("Proxy: synthetic join complete, entering game bridge");
 
