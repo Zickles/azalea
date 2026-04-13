@@ -489,20 +489,9 @@ async fn do_handshake(
         }
     }
 
-    // Static registries the client always has built-in
-    let static_registries: std::collections::HashSet<String> = [
-        "minecraft:block",
-        "minecraft:item",
-        "minecraft:entity_type",
-        "minecraft:fluid",
-        "minecraft:game_event",
-        "minecraft:point_of_interest_type",
-    ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    // Send UpdateTags from game state, filtered to only registries we sent
+    // Send UpdateTags from game state, filtered to only registries the client knows about.
+    // We keep tags for registries we explicitly sent AND tags for any built-in client registry.
+    // Only filter out registries that are known to cause issues (e.g. ViaProxy artifacts).
     let tags_clone = cached_tags.lock().unwrap().clone();
     if let Some(game_tags_raw) = tags_clone {
         if
@@ -511,11 +500,14 @@ async fn do_handshake(
                     &mut Cursor::new(&game_tags_raw as &[u8])
                 )
         {
-            // Only keep tags for registries we sent RegistryData for, or static client registries.
-            // This prevents the client from looking up a registry it didn't receive.
+            // Remove tags for registries the client didn't receive via RegistryData and that
+            // aren't built-in. In practice the only problematic ones are ViaProxy artifacts
+            // like "minecraft:timeline" that don't exist in the target version.
             p.tags.0.retain(|k, _| {
                 let s = k.to_string();
-                seen_registries.contains(&s) || static_registries.contains(&s)
+                // Keep if we sent this registry, or if it's a vanilla built-in (starts with "minecraft:")
+                // and isn't a known ViaProxy artifact.
+                seen_registries.contains(&s) || (s.starts_with("minecraft:") && s != "minecraft:timeline")
             });
 
             let config_tags_pkt = ClientboundConfigPacket::UpdateTags(ClientboundConfigUpdateTags {
