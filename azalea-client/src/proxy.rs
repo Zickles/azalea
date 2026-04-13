@@ -1,7 +1,8 @@
 use std::{ io::Cursor, net::SocketAddr, sync::{ Arc, Mutex, atomic::{ AtomicBool, Ordering } } };
 
 use aes::Aes128;
-use simdnbt::owned::NbtCompound;
+use simdnbt::owned::{NbtCompound, NbtList, NbtTag};
+use simdnbt::Mutf8String;
 use azalea_core::{ entity_id::MinecraftEntityId, game_type::{ GameMode, OptionalGameType } };
 use azalea_crypto::Aes128CfbDec;
 use azalea_entity::{ LookDirection, Position };
@@ -494,16 +495,10 @@ async fn do_handshake(
     // Synthesize missing registries that the 26.1 client expects but older servers don't send.
     // Timeline is new in 26.1; when connecting to 1.21.4 via ViaProxy it won't exist.
     if !seen_registries.contains("minecraft:timeline") {
-        let timeline_entries: Vec<(Identifier, Option<NbtCompound>)> = vec![
-            ("minecraft:day".parse().unwrap(), Some(NbtCompound::new())),
-            ("minecraft:early_game".parse().unwrap(), Some(NbtCompound::new())),
-            ("minecraft:moon".parse().unwrap(), Some(NbtCompound::new())),
-            ("minecraft:villager_schedule".parse().unwrap(), Some(NbtCompound::new())),
-        ];
         let timeline_pkt = ClientboundConfigPacket::RegistryData(
             azalea_protocol::packets::config::ClientboundRegistryData {
                 registry_id: "minecraft:timeline".parse().unwrap(),
-                entries: timeline_entries,
+                entries: synthesize_timeline_entries(),
             },
         );
         write_raw_packet(&serialize_packet(&timeline_pkt)?, &mut write, None, &mut enc).await?;
@@ -749,4 +744,85 @@ async fn client_read_task(
         }
     }
     disconnected.store(true, Ordering::Relaxed);
+}
+
+/// Convert a serde_json::Value to a simdnbt NbtTag, following Minecraft's NbtOps conventions.
+fn json_to_nbt(value: &serde_json::Value) -> NbtTag {
+    match value {
+        serde_json::Value::Bool(b) => NbtTag::Byte(if *b { 1 } else { 0 }),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                NbtTag::Int(i as i32)
+            } else {
+                NbtTag::Double(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => NbtTag::String(s.as_str().into()),
+        serde_json::Value::Array(arr) => {
+            NbtTag::List(json_array_to_list(arr))
+        }
+        serde_json::Value::Object(map) => {
+            let values: Vec<(Mutf8String, NbtTag)> = map
+                .iter()
+                .map(|(k, v)| (Mutf8String::from(k.as_str()), json_to_nbt(v)))
+                .collect();
+            NbtTag::Compound(NbtCompound::from_values(values))
+        }
+        serde_json::Value::Null => NbtTag::Byte(0),
+    }
+}
+
+fn json_array_to_list(arr: &[serde_json::Value]) -> NbtList {
+    if arr.is_empty() {
+        return NbtList::Empty;
+    }
+    match &arr[0] {
+        serde_json::Value::Object(_) => {
+            let compounds: Vec<NbtCompound> = arr.iter().map(|v| {
+                match json_to_nbt(v) {
+                    NbtTag::Compound(c) => c,
+                    _ => NbtCompound::new(),
+                }
+            }).collect();
+            NbtList::Compound(compounds)
+        }
+        serde_json::Value::String(_) => {
+            let strings: Vec<Mutf8String> = arr.iter().filter_map(|v| {
+                v.as_str().map(Mutf8String::from)
+            }).collect();
+            NbtList::String(strings)
+        }
+        serde_json::Value::Number(_) => {
+            // Check if all values are integers
+            if arr.iter().all(|v| v.as_i64().is_some()) {
+                let ints: Vec<i32> = arr.iter().filter_map(|v| v.as_i64().map(|i| i as i32)).collect();
+                NbtList::Int(ints)
+            } else {
+                let doubles: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                NbtList::Double(doubles)
+            }
+        }
+        serde_json::Value::Bool(_) => {
+            let bytes: Vec<i8> = arr.iter().map(|v| if v.as_bool().unwrap_or(false) { 1 } else { 0 }).collect();
+            NbtList::Byte(bytes)
+        }
+        _ => NbtList::Empty,
+    }
+}
+
+fn json_to_compound(json: &str) -> NbtCompound {
+    let value: serde_json::Value = serde_json::from_str(json).expect("invalid timeline JSON");
+    match json_to_nbt(&value) {
+        NbtTag::Compound(c) => c,
+        _ => panic!("expected JSON object"),
+    }
+}
+
+fn synthesize_timeline_entries() -> Vec<(Identifier, Option<NbtCompound>)> {
+    vec![
+        ("minecraft:day".parse().unwrap(), Some(json_to_compound(include_str!("timeline/day.json")))),
+        ("minecraft:early_game".parse().unwrap(), Some(json_to_compound(include_str!("timeline/early_game.json")))),
+        ("minecraft:moon".parse().unwrap(), Some(json_to_compound(include_str!("timeline/moon.json")))),
+        ("minecraft:villager_schedule".parse().unwrap(), Some(json_to_compound(include_str!("timeline/villager_schedule.json")))),
+    ]
 }
