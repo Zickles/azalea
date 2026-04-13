@@ -846,6 +846,69 @@ fn synthesize_missing_registries() -> Vec<(String, Vec<(Identifier, Option<NbtCo
             ("minecraft:quick_actions".parse().unwrap(), Some(json_to_compound(include_str!("dialog/quick_actions.json")))),
             ("minecraft:server_links".parse().unwrap(), Some(json_to_compound(include_str!("dialog/server_links.json")))),
         ]),
+        ("minecraft:cat_sound_variant".to_string(), vec![
+            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("cat_sound_variant/classic.json")))),
+            ("minecraft:royal".parse().unwrap(), Some(json_to_compound(include_str!("cat_sound_variant/royal.json")))),
+        ]),
+        ("minecraft:cat_variant".to_string(), vec![
+            ("minecraft:all_black".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/all_black.json")))),
+            ("minecraft:black".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/black.json")))),
+            ("minecraft:british_shorthair".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/british_shorthair.json")))),
+            ("minecraft:calico".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/calico.json")))),
+            ("minecraft:jellie".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/jellie.json")))),
+            ("minecraft:persian".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/persian.json")))),
+            ("minecraft:ragdoll".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/ragdoll.json")))),
+            ("minecraft:red".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/red.json")))),
+            ("minecraft:siamese".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/siamese.json")))),
+            ("minecraft:tabby".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/tabby.json")))),
+            ("minecraft:white".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/white.json")))),
+        ]),
+        ("minecraft:chicken_sound_variant".to_string(), vec![
+            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("chicken_sound_variant/classic.json")))),
+            ("minecraft:picky".parse().unwrap(), Some(json_to_compound(include_str!("chicken_sound_variant/picky.json")))),
+        ]),
+        ("minecraft:chicken_variant".to_string(), vec![
+            ("minecraft:cold".parse().unwrap(), Some(json_to_compound(include_str!("chicken_variant/cold.json")))),
+            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("chicken_variant/temperate.json")))),
+            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("chicken_variant/warm.json")))),
+        ]),
+        ("minecraft:cow_sound_variant".to_string(), vec![
+            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("cow_sound_variant/classic.json")))),
+            ("minecraft:moody".parse().unwrap(), Some(json_to_compound(include_str!("cow_sound_variant/moody.json")))),
+        ]),
+        ("minecraft:cow_variant".to_string(), vec![
+            ("minecraft:cold".parse().unwrap(), Some(json_to_compound(include_str!("cow_variant/cold.json")))),
+            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("cow_variant/temperate.json")))),
+            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("cow_variant/warm.json")))),
+        ]),
+        ("minecraft:frog_variant".to_string(), vec![
+            ("minecraft:cold".parse().unwrap(), Some(json_to_compound(include_str!("frog_variant/cold.json")))),
+            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("frog_variant/temperate.json")))),
+            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("frog_variant/warm.json")))),
+        ]),
+        ("minecraft:pig_sound_variant".to_string(), vec![
+            ("minecraft:big".parse().unwrap(), Some(json_to_compound(include_str!("pig_sound_variant/big.json")))),
+            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("pig_sound_variant/classic.json")))),
+            ("minecraft:mini".parse().unwrap(), Some(json_to_compound(include_str!("pig_sound_variant/mini.json")))),
+        ]),
+        ("minecraft:pig_variant".to_string(), vec![
+            ("minecraft:cold".parse().unwrap(), Some(json_to_compound(include_str!("pig_variant/cold.json")))),
+            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("pig_variant/temperate.json")))),
+            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("pig_variant/warm.json")))),
+        ]),
+        ("minecraft:wolf_sound_variant".to_string(), vec![
+            ("minecraft:angry".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/angry.json")))),
+            ("minecraft:big".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/big.json")))),
+            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/classic.json")))),
+            ("minecraft:cute".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/cute.json")))),
+            ("minecraft:grumpy".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/grumpy.json")))),
+            ("minecraft:puglin".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/puglin.json")))),
+            ("minecraft:sad".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/sad.json")))),
+        ]),
+        ("minecraft:zombie_nautilus_variant".to_string(), vec![
+            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("zombie_nautilus_variant/temperate.json")))),
+            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("zombie_nautilus_variant/warm.json")))),
+        ]),
     ]
 }
 
