@@ -899,24 +899,11 @@ fn synthesize_missing_registries(
             if seen_registries.contains(reg_name) {
                 continue;
             }
-            // Registries with complex codec-dependent data that our JSON→NBT converter
-            // can't faithfully reproduce. Send entries with None data so the client uses
-            // its built-in defaults instead.
-            const KEYS_ONLY_REGISTRIES: &[&str] = &[
-                "minecraft:enchantment",
-                "minecraft:jukebox_song",
-            ];
-            let keys_only = KEYS_ONLY_REGISTRIES.contains(&reg_name.as_str());
-
             if let serde_json::Value::Object(entries_map) = entries {
                 let parsed: Vec<(Identifier, Option<NbtCompound>)> = entries_map
                     .iter()
                     .map(|(name, data)| {
-                        if keys_only {
-                            (name.parse().unwrap(), None)
-                        } else {
-                            (name.parse().unwrap(), Some(json_to_compound(data)))
-                        }
+                        (name.parse().unwrap(), Some(json_to_compound(data)))
                     })
                     .collect();
                 result.push((reg_name.clone(), parsed));
