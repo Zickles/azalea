@@ -495,11 +495,14 @@ async fn do_handshake(
     let tags_clone = cached_tags.lock().unwrap().clone();
     if let Some(game_tags_raw) = tags_clone {
         if
-            let Ok(ClientboundGamePacket::UpdateTags(p)) =
+            let Ok(ClientboundGamePacket::UpdateTags(mut p)) =
                 deserialize_packet::<ClientboundGamePacket>(
                     &mut Cursor::new(&game_tags_raw as &[u8])
                 )
         {
+            // Remove timeline tags since ViaProxy doesn't translate the timeline registry
+            p.tags.0.retain(|k, _| k.to_string() != "minecraft:timeline");
+
             let config_tags_pkt = ClientboundConfigPacket::UpdateTags(ClientboundConfigUpdateTags {
                 tags: p.tags,
             });
