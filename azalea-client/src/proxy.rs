@@ -6,6 +6,7 @@ use simdnbt::Mutf8String;
 use azalea_core::{ entity_id::MinecraftEntityId, game_type::{ GameMode, OptionalGameType } };
 use azalea_crypto::Aes128CfbDec;
 use azalea_entity::{ LookDirection, Position };
+use azalea_protocol::common::tags::Tags;
 use azalea_protocol::{
     common::movements::{ PositionMoveRotation, RelativeMovements },
     packets::{
@@ -529,6 +530,14 @@ async fn do_handshake(
                 seen_registries.contains(&s) || (s.starts_with("minecraft:") && s != "minecraft:timeline")
             });
 
+            // Inject empty tags for synthesized registries that need them
+            for (reg, tags) in synthesize_missing_tags() {
+                let reg_id: Identifier = reg.parse().unwrap();
+                if !p.tags.0.contains_key(&reg_id) {
+                    p.tags.0.insert(reg_id, tags);
+                }
+            }
+
             let config_tags_pkt = ClientboundConfigPacket::UpdateTags(ClientboundConfigUpdateTags {
                 tags: p.tags,
             });
@@ -836,6 +845,22 @@ fn synthesize_missing_registries() -> Vec<(String, Vec<(Identifier, Option<NbtCo
             ("minecraft:custom_options".parse().unwrap(), Some(json_to_compound(include_str!("dialog/custom_options.json")))),
             ("minecraft:quick_actions".parse().unwrap(), Some(json_to_compound(include_str!("dialog/quick_actions.json")))),
             ("minecraft:server_links".parse().unwrap(), Some(json_to_compound(include_str!("dialog/server_links.json")))),
+        ]),
+    ]
+}
+
+/// Returns tags that need to be injected for synthesized registries.
+fn synthesize_missing_tags() -> Vec<(String, Vec<Tags>)> {
+    vec![
+        ("minecraft:dialog".to_string(), vec![
+            Tags { name: "minecraft:pause_screen_additions".parse().unwrap(), elements: vec![] },
+            Tags { name: "minecraft:quick_actions".parse().unwrap(), elements: vec![] },
+        ]),
+        ("minecraft:timeline".to_string(), vec![
+            Tags { name: "minecraft:universal".parse().unwrap(), elements: vec![3] }, // villager_schedule is index 3
+            Tags { name: "minecraft:in_overworld".parse().unwrap(), elements: vec![3, 0, 2, 1] }, // #universal(villager_schedule), day, moon, early_game
+            Tags { name: "minecraft:in_nether".parse().unwrap(), elements: vec![3] }, // #universal
+            Tags { name: "minecraft:in_end".parse().unwrap(), elements: vec![3] }, // #universal
         ]),
     ]
 }
