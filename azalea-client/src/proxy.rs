@@ -1,6 +1,7 @@
 use std::{ io::Cursor, net::SocketAddr, sync::{ Arc, Mutex, atomic::{ AtomicBool, Ordering } } };
 
 use aes::Aes128;
+use simdnbt::owned::NbtCompound;
 use azalea_core::{ entity_id::MinecraftEntityId, game_type::{ GameMode, OptionalGameType } };
 use azalea_crypto::Aes128CfbDec;
 use azalea_entity::{ LookDirection, Position };
@@ -479,12 +480,6 @@ async fn do_handshake(
                 }
                 ClientboundConfigPacket::RegistryData(p) => {
                     let reg_id = p.registry_id.to_string();
-                    info!("Proxy: config replay registry: {reg_id}");
-                    // Skip registries that ViaProxy creates but doesn't properly populate
-                    if reg_id.contains("timeline") {
-                        info!("Proxy: SKIPPING timeline registry (matched: {reg_id})");
-                        continue;
-                    }
                     if !seen_registries.insert(reg_id) {
                         continue;
                     }
@@ -494,6 +489,27 @@ async fn do_handshake(
             write_raw_packet(raw, &mut write, None, &mut enc).await?;
             forwarded += 1;
         }
+    }
+
+    // Synthesize missing registries that the 26.1 client expects but older servers don't send.
+    // Timeline is new in 26.1; when connecting to 1.21.4 via ViaProxy it won't exist.
+    if !seen_registries.contains("minecraft:timeline") {
+        let timeline_entries: Vec<(Identifier, Option<NbtCompound>)> = vec![
+            ("minecraft:day".parse().unwrap(), Some(NbtCompound::new())),
+            ("minecraft:early_game".parse().unwrap(), Some(NbtCompound::new())),
+            ("minecraft:moon".parse().unwrap(), Some(NbtCompound::new())),
+            ("minecraft:villager_schedule".parse().unwrap(), Some(NbtCompound::new())),
+        ];
+        let timeline_pkt = ClientboundConfigPacket::RegistryData(
+            azalea_protocol::packets::config::ClientboundRegistryData {
+                registry_id: "minecraft:timeline".parse().unwrap(),
+                entries: timeline_entries,
+            },
+        );
+        write_raw_packet(&serialize_packet(&timeline_pkt)?, &mut write, None, &mut enc).await?;
+        seen_registries.insert("minecraft:timeline".to_string());
+        forwarded += 1;
+        info!("Proxy: synthesized minecraft:timeline registry");
     }
 
     // Send UpdateTags from game state, filtered to only registries the client knows about.
