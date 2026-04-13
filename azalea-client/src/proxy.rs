@@ -493,18 +493,19 @@ async fn do_handshake(
     }
 
     // Synthesize missing registries that the 26.1 client expects but older servers don't send.
-    // Timeline is new in 26.1; when connecting to 1.21.4 via ViaProxy it won't exist.
-    if !seen_registries.contains("minecraft:timeline") {
-        let timeline_pkt = ClientboundConfigPacket::RegistryData(
-            azalea_protocol::packets::config::ClientboundRegistryData {
-                registry_id: "minecraft:timeline".parse().unwrap(),
-                entries: synthesize_timeline_entries(),
-            },
-        );
-        write_raw_packet(&serialize_packet(&timeline_pkt)?, &mut write, None, &mut enc).await?;
-        seen_registries.insert("minecraft:timeline".to_string());
-        forwarded += 1;
-        info!("Proxy: synthesized minecraft:timeline registry");
+    for (reg_name, entries) in synthesize_missing_registries() {
+        if !seen_registries.contains(&reg_name) {
+            let pkt = ClientboundConfigPacket::RegistryData(
+                azalea_protocol::packets::config::ClientboundRegistryData {
+                    registry_id: reg_name.parse().unwrap(),
+                    entries,
+                },
+            );
+            write_raw_packet(&serialize_packet(&pkt)?, &mut write, None, &mut enc).await?;
+            seen_registries.insert(reg_name.clone());
+            forwarded += 1;
+            info!("Proxy: synthesized {reg_name} registry");
+        }
     }
 
     // Send UpdateTags from game state, filtered to only registries the client knows about.
@@ -818,11 +819,23 @@ fn json_to_compound(json: &str) -> NbtCompound {
     }
 }
 
-fn synthesize_timeline_entries() -> Vec<(Identifier, Option<NbtCompound>)> {
+/// Returns all 26.1 registries that may be missing when connecting to older servers via ViaProxy.
+fn synthesize_missing_registries() -> Vec<(String, Vec<(Identifier, Option<NbtCompound>)>)> {
     vec![
-        ("minecraft:day".parse().unwrap(), Some(json_to_compound(include_str!("timeline/day.json")))),
-        ("minecraft:early_game".parse().unwrap(), Some(json_to_compound(include_str!("timeline/early_game.json")))),
-        ("minecraft:moon".parse().unwrap(), Some(json_to_compound(include_str!("timeline/moon.json")))),
-        ("minecraft:villager_schedule".parse().unwrap(), Some(json_to_compound(include_str!("timeline/villager_schedule.json")))),
+        ("minecraft:timeline".to_string(), vec![
+            ("minecraft:day".parse().unwrap(), Some(json_to_compound(include_str!("timeline/day.json")))),
+            ("minecraft:early_game".parse().unwrap(), Some(json_to_compound(include_str!("timeline/early_game.json")))),
+            ("minecraft:moon".parse().unwrap(), Some(json_to_compound(include_str!("timeline/moon.json")))),
+            ("minecraft:villager_schedule".parse().unwrap(), Some(json_to_compound(include_str!("timeline/villager_schedule.json")))),
+        ]),
+        ("minecraft:world_clock".to_string(), vec![
+            ("minecraft:overworld".parse().unwrap(), Some(json_to_compound(include_str!("world_clock/overworld.json")))),
+            ("minecraft:the_end".parse().unwrap(), Some(json_to_compound(include_str!("world_clock/the_end.json")))),
+        ]),
+        ("minecraft:dialog".to_string(), vec![
+            ("minecraft:custom_options".parse().unwrap(), Some(json_to_compound(include_str!("dialog/custom_options.json")))),
+            ("minecraft:quick_actions".parse().unwrap(), Some(json_to_compound(include_str!("dialog/quick_actions.json")))),
+            ("minecraft:server_links".parse().unwrap(), Some(json_to_compound(include_str!("dialog/server_links.json")))),
+        ]),
     ]
 }
