@@ -477,6 +477,14 @@ async fn do_handshake(
 
     // Config: send all registry data (deduped) + other config packets except FinishConfiguration.
     // Track which registries we actually sent so we can filter tags accordingly.
+    // Load the vanilla registry manifest to know which registries we can provide ourselves
+    let vanilla_manifest: serde_json::Value =
+        serde_json::from_str(include_str!("vanilla_registries.json")).unwrap();
+    let vanilla_registry_names: std::collections::HashSet<String> = vanilla_manifest
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+
     let replayed = config_packets.lock().unwrap().clone();
     info!("Proxy: replaying {} config packets", replayed.len());
     let mut seen_registries = std::collections::HashSet::<String>::new();
@@ -493,6 +501,11 @@ async fn do_handshake(
                 }
                 ClientboundConfigPacket::RegistryData(p) => {
                     let reg_id = p.registry_id.to_string();
+                    // Skip ViaProxy's version if we have vanilla data — ViaProxy may send
+                    // incompatible formats for registries that changed between versions.
+                    if vanilla_registry_names.contains(&reg_id) {
+                        continue;
+                    }
                     if !seen_registries.insert(reg_id) {
                         continue;
                     }
