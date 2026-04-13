@@ -191,8 +191,9 @@ fn manage_config_buffer(state: Res<ProxyState>, conn_query: Query<&RawConnection
         ConnectionProtocol::Configuration => {
             if state.config_locked.load(Ordering::Relaxed) {
                 state.config_packets.lock().unwrap().clear();
+                state.game_packets.lock().unwrap().clear();
                 state.config_locked.store(false, Ordering::Relaxed);
-                info!("Proxy: config buffer cleared for reconnect");
+                info!("Proxy: config + game buffers cleared for reconnect");
             }
         }
         ConnectionProtocol::Game => {
