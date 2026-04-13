@@ -278,8 +278,17 @@ fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut R
                     let _ = client.clientbound_tx.send(raw);
                 }
             } else {
-                // No client — cache for replay
-                state.game_packets.lock().unwrap().push(raw);
+                // No client — cache for replay.
+                // If the bot re-enters config mode, clear the cache since all game state
+                // will be re-sent after re-config. Don't cache the StartConfiguration itself.
+                if let Ok(ClientboundGamePacket::StartConfiguration(_)) =
+                    deserialize_packet::<ClientboundGamePacket>(&mut Cursor::new(&raw as &[u8]))
+                {
+                    state.game_packets.lock().unwrap().clear();
+                    info!("Proxy: cleared game packet cache (re-config)");
+                } else {
+                    state.game_packets.lock().unwrap().push(raw);
+                }
             }
         }
     }
@@ -686,11 +695,22 @@ async fn do_handshake(
     ).await?;
 
     // Replay all cached game packets (chunks, inventory, entities, etc.)
+    // Filter out StartConfiguration packets — the bot may have gone through re-config,
+    // and replaying StartConfiguration would put the client into config mode where
+    // subsequent game packets get misinterpreted (packet IDs are reused across states).
     let cached_game = game_packets.lock().unwrap().drain(..).collect::<Vec<_>>();
-    info!("Proxy: replaying {} cached game packets", cached_game.len());
-    for raw in cached_game {
-        write_raw_packet(&raw, &mut write, None, &mut enc).await?;
+    let mut game_replayed = 0usize;
+    for raw in &cached_game {
+        if let Ok(ClientboundGamePacket::StartConfiguration(_)) =
+            deserialize_packet::<ClientboundGamePacket>(&mut Cursor::new(raw as &[u8]))
+        {
+            info!("Proxy: skipping StartConfiguration in game packet replay");
+            continue;
+        }
+        write_raw_packet(raw, &mut write, None, &mut enc).await?;
+        game_replayed += 1;
     }
+    info!("Proxy: replayed {game_replayed}/{} cached game packets", cached_game.len());
 
     info!("Proxy: synthetic join complete, entering game bridge");
 
