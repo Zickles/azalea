@@ -478,7 +478,12 @@ async fn do_handshake(
                     continue;
                 }
                 ClientboundConfigPacket::RegistryData(p) => {
-                    if !seen_registries.insert(p.registry_id.to_string()) {
+                    let reg_id = p.registry_id.to_string();
+                    // Skip registries that ViaProxy creates but doesn't properly populate
+                    if reg_id == "minecraft:timeline" {
+                        continue;
+                    }
+                    if !seen_registries.insert(reg_id) {
                         continue;
                     }
                 }
