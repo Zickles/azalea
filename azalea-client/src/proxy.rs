@@ -230,25 +230,31 @@ fn cache_game_state(
 
 fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     let mut attached = state.attached.lock().unwrap();
-    let Some(client) = attached.as_mut() else { return };
-
-    if client.disconnected.load(Ordering::Relaxed) {
-        info!("Vanilla client detached");
-        *attached = None;
-        return;
-    }
 
     for mut conn in conn_query.iter_mut() {
         if conn.state != ConnectionProtocol::Game { continue; }
         for raw in conn.take_tapped_packets() {
-            // Cache UpdateTags for replaying to new connecting clients
+            // Always cache UpdateTags regardless of client attachment
             if let Ok(ClientboundGamePacket::UpdateTags(_)) = deserialize_packet::<ClientboundGamePacket>(
                 &mut Cursor::new(&raw as &[u8])
             ) {
                 *state.cached_tags.lock().unwrap() = Some(raw.clone());
                 info!("Proxy: cached UpdateTags from game state");
             }
-            let _ = client.clientbound_tx.send(raw);
+            // Only forward to client if attached
+            if let Some(client) = attached.as_mut() {
+                if !client.disconnected.load(Ordering::Relaxed) {
+                    let _ = client.clientbound_tx.send(raw);
+                }
+            }
+        }
+    }
+
+    // Handle disconnected client
+    if let Some(client) = attached.as_ref() {
+        if client.disconnected.load(Ordering::Relaxed) {
+            info!("Vanilla client detached");
+            *attached = None;
         }
     }
 }
