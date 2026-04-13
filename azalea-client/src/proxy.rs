@@ -479,8 +479,10 @@ async fn do_handshake(
                 }
                 ClientboundConfigPacket::RegistryData(p) => {
                     let reg_id = p.registry_id.to_string();
+                    info!("Proxy: config replay registry: {reg_id}");
                     // Skip registries that ViaProxy creates but doesn't properly populate
-                    if reg_id == "minecraft:timeline" {
+                    if reg_id.contains("timeline") {
+                        info!("Proxy: SKIPPING timeline registry (matched: {reg_id})");
                         continue;
                     }
                     if !seen_registries.insert(reg_id) {
