@@ -191,11 +191,11 @@ fn manage_config_buffer(state: Res<ProxyState>, conn_query: Query<&RawConnection
 
 fn buffer_config_packets(state: Res<ProxyState>, mut conn_query: Query<&mut RawConnection>) {
     for mut conn in conn_query.iter_mut() {
-        let tapped = conn.take_tapped_packets();
-        if tapped.is_empty() { continue; }
         if conn.state != ConnectionProtocol::Configuration || state.config_locked.load(Ordering::Relaxed) {
             continue;
         }
+        let tapped = conn.take_tapped_packets();
+        if tapped.is_empty() { continue; }
         let mut buf = state.config_packets.lock().unwrap();
         for raw in tapped { buf.push(raw); }
     }
