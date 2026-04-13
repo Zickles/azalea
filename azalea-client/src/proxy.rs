@@ -499,6 +499,11 @@ async fn do_handshake(
                 ClientboundConfigPacket::FinishConfiguration(_) => {
                     continue;
                 }
+                ClientboundConfigPacket::UpdateTags(_) => {
+                    // Skip ViaProxy's config-phase tags — we provide our own
+                    // filtered tags from the game state + synthesized registries.
+                    continue;
+                }
                 ClientboundConfigPacket::RegistryData(p) => {
                     let reg_id = p.registry_id.to_string();
                     // Skip ViaProxy's version if we have vanilla data — ViaProxy may send
