@@ -101,6 +101,7 @@ impl Plugin for ProxyPlugin {
         let config_locked = Arc::new(AtomicBool::new(false));
         let game_state: Arc<Mutex<Option<CachedGameState>>> = Arc::new(Mutex::new(None));
         let cached_tags: Arc<Mutex<Option<Box<[u8]>>>> = Arc::new(Mutex::new(None));
+        let game_packets: Arc<Mutex<Vec<Box<[u8]>>>> = Arc::new(Mutex::new(Vec::new()));
 
         let state = ProxyState {
             attached: Arc::new(Mutex::new(None)),
@@ -109,6 +110,7 @@ impl Plugin for ProxyPlugin {
             config_locked: config_locked.clone(),
             game_state: game_state.clone(),
             cached_tags: cached_tags.clone(),
+            game_packets: game_packets.clone(),
         };
 
         let bind_addr = self.bind_addr;
@@ -122,7 +124,8 @@ impl Plugin for ProxyPlugin {
                     client_tx,
                     config_packets,
                     game_state,
-                    cached_tags
+                    cached_tags,
+                    game_packets
                 )
             );
         });
@@ -150,6 +153,7 @@ pub struct ProxyState {
     config_locked: Arc<AtomicBool>,
     pub game_state: Arc<Mutex<Option<CachedGameState>>>,
     pub cached_tags: Arc<Mutex<Option<Box<[u8]>>>>,
+    pub game_packets: Arc<Mutex<Vec<Box<[u8]>>>>,
 }
 
 pub struct PendingClient {
@@ -266,12 +270,16 @@ fn forward_server_to_client(state: Res<ProxyState>, mut conn_query: Query<&mut R
                     deserialize_packet::<ClientboundGamePacket>(&mut Cursor::new(&raw as &[u8]))
             {
                 *state.cached_tags.lock().unwrap() = Some(raw.clone());
-                info!("Proxy: cached UpdateTags from game state");
             }
+
             if let Some(client) = attached.as_mut() {
+                // Client is connected — forward live
                 if !client.disconnected.load(Ordering::Relaxed) {
                     let _ = client.clientbound_tx.send(raw);
                 }
+            } else {
+                // No client — cache for replay
+                state.game_packets.lock().unwrap().push(raw);
             }
         }
     }
@@ -326,7 +334,8 @@ async fn run_listener(
     client_tx: mpsc::UnboundedSender<PendingClient>,
     config_packets: Arc<Mutex<Vec<Box<[u8]>>>>,
     game_state: Arc<Mutex<Option<CachedGameState>>>,
-    cached_tags: Arc<Mutex<Option<Box<[u8]>>>>
+    cached_tags: Arc<Mutex<Option<Box<[u8]>>>>,
+    game_packets: Arc<Mutex<Vec<Box<[u8]>>>>
 ) {
     let listener = TcpListener::bind(bind_addr).await.expect("ProxyPlugin: failed to bind");
     info!("ProxyPlugin listening on {bind_addr}");
@@ -341,8 +350,9 @@ async fn run_listener(
                 let cfg = config_packets.clone();
                 let gs = game_state.clone();
                 let ct = cached_tags.clone();
+                let gp = game_packets.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = do_handshake(stream, pk, pubk, tx, cfg, gs, ct).await {
+                    if let Err(e) = do_handshake(stream, pk, pubk, tx, cfg, gs, ct, gp).await {
                         warn!("Proxy handshake error: {e}");
                     }
                 });
@@ -359,7 +369,8 @@ async fn do_handshake(
     client_tx: mpsc::UnboundedSender<PendingClient>,
     config_packets: Arc<Mutex<Vec<Box<[u8]>>>>,
     game_state: Arc<Mutex<Option<CachedGameState>>>,
-    cached_tags: Arc<Mutex<Option<Box<[u8]>>>>
+    cached_tags: Arc<Mutex<Option<Box<[u8]>>>>,
+    game_packets: Arc<Mutex<Vec<Box<[u8]>>>>
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
     let (mut read, mut write) = stream.into_split();
@@ -653,6 +664,13 @@ async fn do_handshake(
         None,
         &mut enc
     ).await?;
+
+    // Replay all cached game packets (chunks, inventory, entities, etc.)
+    let cached_game = game_packets.lock().unwrap().drain(..).collect::<Vec<_>>();
+    info!("Proxy: replaying {} cached game packets", cached_game.len());
+    for raw in cached_game {
+        write_raw_packet(&raw, &mut write, None, &mut enc).await?;
+    }
 
     info!("Proxy: synthetic join complete, entering game bridge");
 
