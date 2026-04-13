@@ -494,19 +494,18 @@ async fn do_handshake(
     }
 
     // Synthesize missing registries that the 26.1 client expects but older servers don't send.
-    for (reg_name, entries) in synthesize_missing_registries() {
-        if !seen_registries.contains(&reg_name) {
-            let pkt = ClientboundConfigPacket::RegistryData(
-                azalea_protocol::packets::config::ClientboundRegistryData {
-                    registry_id: reg_name.parse().unwrap(),
-                    entries,
-                },
-            );
-            write_raw_packet(&serialize_packet(&pkt)?, &mut write, None, &mut enc).await?;
-            seen_registries.insert(reg_name.clone());
-            forwarded += 1;
-            info!("Proxy: synthesized {reg_name} registry");
-        }
+    let synthesized = synthesize_missing_registries(&seen_registries);
+    for (reg_name, entries) in &synthesized {
+        let pkt = ClientboundConfigPacket::RegistryData(
+            azalea_protocol::packets::config::ClientboundRegistryData {
+                registry_id: reg_name.parse().unwrap(),
+                entries: entries.clone(),
+            },
+        );
+        write_raw_packet(&serialize_packet(&pkt)?, &mut write, None, &mut enc).await?;
+        seen_registries.insert(reg_name.clone());
+        forwarded += 1;
+        info!("Proxy: synthesized {reg_name} registry");
     }
 
     // Send UpdateTags from game state, filtered to only registries the client knows about.
@@ -530,8 +529,8 @@ async fn do_handshake(
                 seen_registries.contains(&s) || (s.starts_with("minecraft:") && s != "minecraft:timeline")
             });
 
-            // Inject empty tags for synthesized registries that need them
-            for (reg, tags) in synthesize_missing_tags() {
+            // Inject tags for synthesized registries that need them
+            for (reg, tags) in synthesize_missing_tags(&seen_registries, &synthesized) {
                 let reg_id: Identifier = reg.parse().unwrap();
                 if !p.tags.0.contains_key(&reg_id) {
                     p.tags.0.insert(reg_id, tags);
@@ -820,110 +819,90 @@ fn json_array_to_list(arr: &[serde_json::Value]) -> NbtList {
     }
 }
 
-fn json_to_compound(json: &str) -> NbtCompound {
-    let value: serde_json::Value = serde_json::from_str(json).expect("invalid timeline JSON");
-    match json_to_nbt(&value) {
+fn json_to_compound(value: &serde_json::Value) -> NbtCompound {
+    match json_to_nbt(value) {
         NbtTag::Compound(c) => c,
-        _ => panic!("expected JSON object"),
+        _ => NbtCompound::new(),
     }
 }
 
-/// Returns all 26.1 registries that may be missing when connecting to older servers via ViaProxy.
-fn synthesize_missing_registries() -> Vec<(String, Vec<(Identifier, Option<NbtCompound>)>)> {
-    vec![
-        ("minecraft:timeline".to_string(), vec![
-            ("minecraft:day".parse().unwrap(), Some(json_to_compound(include_str!("timeline/day.json")))),
-            ("minecraft:early_game".parse().unwrap(), Some(json_to_compound(include_str!("timeline/early_game.json")))),
-            ("minecraft:moon".parse().unwrap(), Some(json_to_compound(include_str!("timeline/moon.json")))),
-            ("minecraft:villager_schedule".parse().unwrap(), Some(json_to_compound(include_str!("timeline/villager_schedule.json")))),
-        ]),
-        ("minecraft:world_clock".to_string(), vec![
-            ("minecraft:overworld".parse().unwrap(), Some(json_to_compound(include_str!("world_clock/overworld.json")))),
-            ("minecraft:the_end".parse().unwrap(), Some(json_to_compound(include_str!("world_clock/the_end.json")))),
-        ]),
-        ("minecraft:dialog".to_string(), vec![
-            ("minecraft:custom_options".parse().unwrap(), Some(json_to_compound(include_str!("dialog/custom_options.json")))),
-            ("minecraft:quick_actions".parse().unwrap(), Some(json_to_compound(include_str!("dialog/quick_actions.json")))),
-            ("minecraft:server_links".parse().unwrap(), Some(json_to_compound(include_str!("dialog/server_links.json")))),
-        ]),
-        ("minecraft:cat_sound_variant".to_string(), vec![
-            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("cat_sound_variant/classic.json")))),
-            ("minecraft:royal".parse().unwrap(), Some(json_to_compound(include_str!("cat_sound_variant/royal.json")))),
-        ]),
-        ("minecraft:cat_variant".to_string(), vec![
-            ("minecraft:all_black".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/all_black.json")))),
-            ("minecraft:black".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/black.json")))),
-            ("minecraft:british_shorthair".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/british_shorthair.json")))),
-            ("minecraft:calico".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/calico.json")))),
-            ("minecraft:jellie".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/jellie.json")))),
-            ("minecraft:persian".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/persian.json")))),
-            ("minecraft:ragdoll".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/ragdoll.json")))),
-            ("minecraft:red".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/red.json")))),
-            ("minecraft:siamese".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/siamese.json")))),
-            ("minecraft:tabby".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/tabby.json")))),
-            ("minecraft:white".parse().unwrap(), Some(json_to_compound(include_str!("cat_variant/white.json")))),
-        ]),
-        ("minecraft:chicken_sound_variant".to_string(), vec![
-            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("chicken_sound_variant/classic.json")))),
-            ("minecraft:picky".parse().unwrap(), Some(json_to_compound(include_str!("chicken_sound_variant/picky.json")))),
-        ]),
-        ("minecraft:chicken_variant".to_string(), vec![
-            ("minecraft:cold".parse().unwrap(), Some(json_to_compound(include_str!("chicken_variant/cold.json")))),
-            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("chicken_variant/temperate.json")))),
-            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("chicken_variant/warm.json")))),
-        ]),
-        ("minecraft:cow_sound_variant".to_string(), vec![
-            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("cow_sound_variant/classic.json")))),
-            ("minecraft:moody".parse().unwrap(), Some(json_to_compound(include_str!("cow_sound_variant/moody.json")))),
-        ]),
-        ("minecraft:cow_variant".to_string(), vec![
-            ("minecraft:cold".parse().unwrap(), Some(json_to_compound(include_str!("cow_variant/cold.json")))),
-            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("cow_variant/temperate.json")))),
-            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("cow_variant/warm.json")))),
-        ]),
-        ("minecraft:frog_variant".to_string(), vec![
-            ("minecraft:cold".parse().unwrap(), Some(json_to_compound(include_str!("frog_variant/cold.json")))),
-            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("frog_variant/temperate.json")))),
-            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("frog_variant/warm.json")))),
-        ]),
-        ("minecraft:pig_sound_variant".to_string(), vec![
-            ("minecraft:big".parse().unwrap(), Some(json_to_compound(include_str!("pig_sound_variant/big.json")))),
-            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("pig_sound_variant/classic.json")))),
-            ("minecraft:mini".parse().unwrap(), Some(json_to_compound(include_str!("pig_sound_variant/mini.json")))),
-        ]),
-        ("minecraft:pig_variant".to_string(), vec![
-            ("minecraft:cold".parse().unwrap(), Some(json_to_compound(include_str!("pig_variant/cold.json")))),
-            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("pig_variant/temperate.json")))),
-            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("pig_variant/warm.json")))),
-        ]),
-        ("minecraft:wolf_sound_variant".to_string(), vec![
-            ("minecraft:angry".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/angry.json")))),
-            ("minecraft:big".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/big.json")))),
-            ("minecraft:classic".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/classic.json")))),
-            ("minecraft:cute".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/cute.json")))),
-            ("minecraft:grumpy".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/grumpy.json")))),
-            ("minecraft:puglin".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/puglin.json")))),
-            ("minecraft:sad".parse().unwrap(), Some(json_to_compound(include_str!("wolf_sound_variant/sad.json")))),
-        ]),
-        ("minecraft:zombie_nautilus_variant".to_string(), vec![
-            ("minecraft:temperate".parse().unwrap(), Some(json_to_compound(include_str!("zombie_nautilus_variant/temperate.json")))),
-            ("minecraft:warm".parse().unwrap(), Some(json_to_compound(include_str!("zombie_nautilus_variant/warm.json")))),
-        ]),
-    ]
+/// Parses the bundled vanilla 26.1 registry data and returns entries for any registry
+/// not already in `seen_registries`. This handles all registries that ViaProxy might
+/// not provide when translating from older server versions.
+fn synthesize_missing_registries(
+    seen_registries: &std::collections::HashSet<String>,
+) -> Vec<(String, Vec<(Identifier, Option<NbtCompound>)>)> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("vanilla_registries.json")).unwrap();
+
+    let mut result = Vec::new();
+    if let serde_json::Value::Object(registries) = &manifest {
+        for (reg_name, entries) in registries {
+            if seen_registries.contains(reg_name) {
+                continue;
+            }
+            if let serde_json::Value::Object(entries_map) = entries {
+                let parsed: Vec<(Identifier, Option<NbtCompound>)> = entries_map
+                    .iter()
+                    .map(|(name, data)| {
+                        (name.parse().unwrap(), Some(json_to_compound(data)))
+                    })
+                    .collect();
+                result.push((reg_name.clone(), parsed));
+            }
+        }
+    }
+    result
 }
 
-/// Returns tags that need to be injected for synthesized registries.
-fn synthesize_missing_tags() -> Vec<(String, Vec<Tags>)> {
-    vec![
-        ("minecraft:dialog".to_string(), vec![
-            Tags { name: "minecraft:pause_screen_additions".parse().unwrap(), elements: vec![] },
-            Tags { name: "minecraft:quick_actions".parse().unwrap(), elements: vec![] },
-        ]),
-        ("minecraft:timeline".to_string(), vec![
-            Tags { name: "minecraft:universal".parse().unwrap(), elements: vec![3] }, // villager_schedule is index 3
-            Tags { name: "minecraft:in_overworld".parse().unwrap(), elements: vec![3, 0, 2, 1] }, // #universal(villager_schedule), day, moon, early_game
-            Tags { name: "minecraft:in_nether".parse().unwrap(), elements: vec![3] }, // #universal
-            Tags { name: "minecraft:in_end".parse().unwrap(), elements: vec![3] }, // #universal
-        ]),
-    ]
+/// Parses the bundled vanilla 26.1 tag data and injects tags for any registry
+/// that we synthesized. Tags reference entries by protocol ID (index in the entries list).
+fn synthesize_missing_tags(
+    seen_registries: &std::collections::HashSet<String>,
+    synthesized_registries: &[(String, Vec<(Identifier, Option<NbtCompound>)>)],
+) -> Vec<(String, Vec<Tags>)> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("vanilla_tags.json")).unwrap();
+
+    let mut result = Vec::new();
+    if let serde_json::Value::Object(tag_registries) = &manifest {
+        for (reg_name, tag_entries) in tag_registries {
+            // Only inject tags for registries we synthesized
+            let synth = synthesized_registries.iter().find(|(n, _)| n == reg_name);
+            if synth.is_none() && seen_registries.contains(reg_name) {
+                continue;
+            }
+
+            if let serde_json::Value::Object(tags_map) = tag_entries {
+                // Build name→index lookup for entries in this registry
+                let entry_index: std::collections::HashMap<String, i32> = if let Some((_, entries)) = synth {
+                    entries.iter().enumerate().map(|(i, (id, _))| (id.to_string(), i as i32)).collect()
+                } else {
+                    continue;
+                };
+
+                let tags: Vec<Tags> = tags_map
+                    .iter()
+                    .map(|(tag_name, values)| {
+                        let elements: Vec<i32> = values
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .filter_map(|v| {
+                                let s = v.as_str()?;
+                                if s.starts_with('#') {
+                                    None // Skip tag references, they need recursive resolution
+                                } else {
+                                    entry_index.get(s).copied()
+                                }
+                            })
+                            .collect();
+                        Tags { name: tag_name.parse().unwrap(), elements }
+                    })
+                    .collect();
+                result.push((reg_name.clone(), tags));
+            }
+        }
+    }
+    result
 }
