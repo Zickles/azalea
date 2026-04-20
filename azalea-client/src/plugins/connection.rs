@@ -1,6 +1,7 @@
 use std::{ fmt::Debug, io::Cursor, mem, sync::{ Arc, atomic::{ self, AtomicBool } } };
 
 use azalea_crypto::Aes128CfbEnc;
+use parking_lot::Mutex;
 use azalea_protocol::{
     connect::{ RawReadConnection, RawWriteConnection },
     packets::{
@@ -212,7 +213,7 @@ impl RawConnection {
         let mut conn = Self::new_networkless(state);
         conn.network = Some(NetworkConnection {
             reader,
-            enc_cipher: writer.enc_cipher,
+            enc_cipher: Arc::new(Mutex::new(writer.enc_cipher)),
             network_packet_writer_tx,
             writer_task,
         });
@@ -309,7 +310,7 @@ pub fn handle_raw_packet(
 pub struct NetworkConnection {
     reader: RawReadConnection,
     // compression threshold is in the RawReadConnection
-    pub enc_cipher: Option<Aes128CfbEnc>,
+    pub enc_cipher: Arc<Mutex<Option<Aes128CfbEnc>>>,
 
     pub writer_task: bevy_tasks::Task<()>,
     /// A queue of raw TCP packets to send.
@@ -331,13 +332,30 @@ impl NetworkConnection {
     }
 
     pub fn write_raw(&mut self, raw_packet: &[u8]) -> Result<(), WritePacketError> {
+        let mut cipher = self.enc_cipher.lock();
         let network_packet = azalea_protocol::write::encode_to_network_packet(
             raw_packet,
             self.reader.compression_threshold,
-            &mut self.enc_cipher
+            &mut cipher
         );
         self.network_packet_writer_tx.send(network_packet.into_boxed_slice())?;
         Ok(())
+    }
+
+    /// Returns a cheap-to-clone, thread-safe handle that lets you write raw
+    /// packets to this connection from outside the Bevy ECS.
+    ///
+    /// This is useful for proxy-style use cases that need to forward raw
+    /// packet bytes to the server from a tokio task in realtime, without
+    /// being bottlenecked on the ECS Update schedule (which, under heavy
+    /// server load, can fall seconds behind and cause bursty packet delivery
+    /// that servers may interpret as invalid movement).
+    pub fn writer_handle(&self) -> NetworkWriter {
+        NetworkWriter {
+            sender: self.network_packet_writer_tx.clone(),
+            compression_threshold: self.reader.compression_threshold,
+            enc_cipher: self.enc_cipher.clone(),
+        }
     }
 
     /// Makes sure packets get sent and returns Some(()) if the connection has
@@ -358,7 +376,37 @@ impl NetworkConnection {
         trace!("Enabled protocol encryption");
         let (enc_cipher, dec_cipher) = azalea_crypto::create_cipher(&key);
         self.reader.dec_cipher = Some(dec_cipher);
-        self.enc_cipher = Some(enc_cipher);
+        *self.enc_cipher.lock() = Some(enc_cipher);
+    }
+}
+
+/// Thread-safe, clonable handle for writing raw packets to a server from
+/// outside the ECS. Obtain one via [`NetworkConnection::writer_handle`].
+///
+/// Sharing the underlying encryption cipher is safe — it's behind a mutex
+/// on both this handle and the connection itself, so concurrent writes are
+/// serialized per-cipher-operation (which is required for correctness of
+/// Aes128Cfb's stateful cipher).
+#[derive(Clone)]
+pub struct NetworkWriter {
+    sender: mpsc::UnboundedSender<Box<[u8]>>,
+    compression_threshold: Option<u32>,
+    enc_cipher: Arc<Mutex<Option<Aes128CfbEnc>>>,
+}
+
+impl NetworkWriter {
+    /// Write a raw packet (the serialized packet ID + payload, WITHOUT any
+    /// length prefix / compression / encryption framing). We add the framing
+    /// and send to the server's TCP writer task.
+    pub fn write_raw(&self, raw_packet: &[u8]) -> Result<(), WritePacketError> {
+        let mut cipher = self.enc_cipher.lock();
+        let network_packet = azalea_protocol::write::encode_to_network_packet(
+            raw_packet,
+            self.compression_threshold,
+            &mut cipher,
+        );
+        self.sender.send(network_packet.into_boxed_slice())?;
+        Ok(())
     }
 }
 
