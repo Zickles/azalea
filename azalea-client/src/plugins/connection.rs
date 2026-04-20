@@ -267,6 +267,16 @@ impl RawConnection {
     pub fn net_conn(&mut self) -> Option<&mut NetworkConnection> {
         self.network.as_mut()
     }
+
+    /// Returns a thread-safe, clonable handle that can be used to write raw
+    /// packets to the server from outside the Bevy ECS. Returns `None` if
+    /// this connection isn't currently networked (e.g. we're between
+    /// connections / disconnected).
+    ///
+    /// See [`NetworkConnection::writer_handle`] for details.
+    pub fn writer_handle(&self) -> Option<NetworkWriter> {
+        self.network.as_ref().map(|n| n.writer_handle())
+    }
 }
 
 pub fn handle_raw_packet(
